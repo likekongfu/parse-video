@@ -131,6 +131,8 @@ def _store_material(data: dict[str, Any]) -> str:
     _init_material_db()
     _cleanup_material_records()
     material_id = "mat_" + uuid.uuid4().hex
+    download_token = secrets.token_urlsafe(24)
+    data["download_token"] = download_token
     now = int(time.time())
     expires_at = now + _MATERIAL_RECORD_TTL_SECONDS
     resource_type = "video" if data.get("video_url") else "image"
@@ -311,13 +313,17 @@ async def video_id_parse(source: VideoSource, video_id: str):
         return _api_response(500, str(err))
 
 
-@app.get("/material/download", dependencies=_auth_dependency)
-async def material_download(id: str, type: str = "video", index: int = 0):
+@app.get("/material/download")
+async def material_download(id: str, token: str, type: str = "video", index: int = 0):
     resource_type = type.strip().lower()
     if resource_type not in {"video", "image", "live_photo"}:
         raise HTTPException(status_code=400, detail="Unsupported material type")
 
     material = _get_material(id)
+    expected_token = str(material.get("download_token") or "")
+    if not expected_token or not secrets.compare_digest(token, expected_token):
+        raise HTTPException(status_code=401, detail="Invalid download token")
+
     resource_url = _resolve_material_url(material, resource_type, index)
 
     client = create_async_client(
