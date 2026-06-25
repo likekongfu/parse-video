@@ -208,3 +208,29 @@ print(
 | flake8      | 工程化：代码风格一致性                          |
 | isort       | 工程化：格式化导入package                     |
 | black       | 工程化：代码格式化                            |
+# Material download storage
+
+The web service creates the `material_records` table on startup. In production,
+configure MySQL with environment variables. If MySQL is not configured, the
+service falls back to local SQLite for development.
+
+Parsed resources are written into this table and can be downloaded through:
+
+```text
+GET /material/download?id=mat_xxx&type=video
+GET /material/download?id=mat_xxx&type=image&index=0
+```
+
+Environment variables:
+
+- `MYSQL_HOST`: MySQL host. If empty, SQLite fallback is used.
+- `MYSQL_PORT`: MySQL port. Default: `3306`.
+- `MYSQL_USER`: MySQL user.
+- `MYSQL_PASSWORD`: MySQL password.
+- `MYSQL_DATABASE`: MySQL database name.
+- `MYSQL_CHARSET`: MySQL charset. Default: `utf8mb4`.
+- `MATERIAL_DB_PATH`: SQLite database path. Default: `data/materials.db`.
+- `MATERIAL_RECORD_TTL_SECONDS`: record retention time. Default: `3600`.
+- `MATERIAL_DOWNLOAD_TIMEOUT_SECONDS`: upstream download timeout. Default: `120`.
+
+For Docker, mount `data/` if you want records to survive container recreation.

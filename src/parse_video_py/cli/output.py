@@ -1,4 +1,4 @@
-"""CLI 输出格式化模块，对齐 Go 版 parse-video 的输出格式"""
+"""CLI 输出格式化工具。"""
 
 import dataclasses
 import json
@@ -8,16 +8,18 @@ from parse_video_py.parser.base import VideoInfo
 
 
 def format_text_output(info: VideoInfo) -> str:
-    """文本格式输出（对齐 Go 版 formatTextOutput）"""
+    """把解析结果格式化成人类容易阅读的文本。"""
     lines = []
     lines.append(f"标题: {info.title}")
     lines.append(f"作者: {info.author.name} (UID: {info.author.uid})")
+
     if info.video_url:
         lines.append(f"视频地址: {info.video_url}")
     if info.cover_url:
         lines.append(f"封面地址: {info.cover_url}")
     if info.music_url:
         lines.append(f"音乐地址: {info.music_url}")
+
     if info.images:
         lines.append("图片列表:")
         for i, img in enumerate(info.images, 1):
@@ -27,17 +29,18 @@ def format_text_output(info: VideoInfo) -> str:
                 lines.append(f"  [{i}] {img.url}")
     else:
         lines.append("图片数量: 0")
+
     return "\n".join(lines)
 
 
 def format_json_output(info: VideoInfo) -> str:
-    """JSON 格式输出"""
+    """把 dataclass 解析结果转换成 JSON 字符串。"""
     data = dataclasses.asdict(info)
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
 def output_result(info: VideoInfo, fmt: str = "text") -> None:
-    """输出单条解析结果到 stdout"""
+    """把单条解析结果输出到 stdout。"""
     if fmt == "json":
         print(format_json_output(info))
     else:
@@ -45,6 +48,6 @@ def output_result(info: VideoInfo, fmt: str = "text") -> None:
 
 
 def output_batch_error(input_url: str, error_msg: str) -> None:
-    """输出批量解析中的错误"""
+    """批量解析时，把单条失败信息输出到 stderr。"""
     print(f"[失败] {input_url}", file=sys.stderr)
     print(f"错误: {error_msg}", file=sys.stderr)
