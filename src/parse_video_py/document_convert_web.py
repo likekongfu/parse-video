@@ -1,3 +1,4 @@
+import base64
 import os
 import shutil
 import subprocess
@@ -6,7 +7,7 @@ import uuid
 from pathlib import Path
 from typing import Iterable
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 from pdf2docx import Converter
 from starlette.background import BackgroundTask
@@ -16,6 +17,11 @@ ALLOWED_EXTENSIONS = {".doc", ".docx", ".rtf", ".odt"}
 PDF_EXTENSIONS = {".pdf"}
 MAX_UPLOAD_BYTES = int(os.getenv("DOCUMENT_CONVERTER_MAX_UPLOAD_BYTES", "15728640"))
 CONVERT_TIMEOUT_SECONDS = int(os.getenv("DOCUMENT_CONVERTER_TIMEOUT_SECONDS", "90"))
+PDF_IMAGE_ZOOM = float(os.getenv("DOCUMENT_CONVERTER_PDF_IMAGE_ZOOM", "1.6"))
+PDF_IMAGE_MAX_PAGES = int(os.getenv("DOCUMENT_CONVERTER_PDF_IMAGE_MAX_PAGES", "20"))
+PDF_IMAGE_MAX_RESPONSE_BYTES = int(
+    os.getenv("DOCUMENT_CONVERTER_PDF_IMAGE_MAX_RESPONSE_BYTES", "12582912")
+)
 LIBREOFFICE_BIN = os.getenv("LIBREOFFICE_BIN", "libreoffice")
 API_TOKEN = os.getenv("DOCUMENT_CONVERTER_TOKEN", "").strip()
 DISABLE_DOCS = os.getenv("DISABLE_DOCS", "").strip().lower() in {
@@ -76,6 +82,36 @@ def validate_pdf_extension(filename: str) -> str:
             detail="Unsupported file type. Allowed: .pdf",
         )
     return suffix
+
+
+def parse_page_range(text: str | None, total_pages: int) -> list[int]:
+    value = (text or "").replace(" ", "").strip()
+    if not value:
+        return list(range(1, total_pages + 1))
+    pages: list[int] = []
+    for part in value.split(","):
+        if not part:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid page range",
+            )
+        start_text, separator, end_text = part.partition("-")
+        if not start_text.isdigit() or (separator and not end_text.isdigit()):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid page range",
+            )
+        start = int(start_text)
+        end = int(end_text or start_text)
+        if start < 1 or end < start or end > total_pages:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Page range must be between 1 and {total_pages}",
+            )
+        for page in range(start, end + 1):
+            if page not in pages:
+                pages.append(page)
+    return pages
 
 
 async def save_upload(upload: UploadFile, target_path: Path) -> int:
@@ -162,6 +198,64 @@ def run_pdf2docx(input_path: Path, output_path: Path) -> Path:
     return output_path
 
 
+def render_pdf_pages(input_path: Path, page_range: str | None) -> list[dict]:
+    try:
+        import fitz
+    except ImportError as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="PyMuPDF is not installed",
+        ) from error
+
+    try:
+        document = fitz.open(str(input_path))
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(error)[-800:] or "Failed to open PDF",
+        ) from error
+
+    try:
+        total_pages = document.page_count
+        pages = parse_page_range(page_range, total_pages)
+        if not pages:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No pages selected",
+            )
+        if len(pages) > PDF_IMAGE_MAX_PAGES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"Too many pages selected. Max: {PDF_IMAGE_MAX_PAGES}",
+            )
+
+        matrix = fitz.Matrix(PDF_IMAGE_ZOOM, PDF_IMAGE_ZOOM)
+        images = []
+        total_bytes = 0
+        for index, page_no in enumerate(pages, start=1):
+            page = document.load_page(page_no - 1)
+            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+            image_bytes = pixmap.tobytes("png")
+            total_bytes += len(image_bytes)
+            if total_bytes > PDF_IMAGE_MAX_RESPONSE_BYTES:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail="Rendered images are too large, please select fewer pages",
+                )
+            images.append(
+                {
+                    "page": page_no,
+                    "name": f"pdf-page-{page_no}-{index}.png",
+                    "mimeType": "image/png",
+                    "size": len(image_bytes),
+                    "base64": base64.b64encode(image_bytes).decode("ascii"),
+                }
+            )
+        return images
+    finally:
+        document.close()
+
+
 def cleanup_paths(paths: Iterable[Path]) -> None:
     for path in paths:
         try:
@@ -211,6 +305,38 @@ async def pdf_to_word(file: UploadFile = File(...)):
     except Exception:
         cleanup_paths([work_dir])
         raise
+
+
+@app.post("/document/pdf-to-images", dependencies=[Depends(require_token)])
+async def pdf_to_images(
+    file: UploadFile = File(...),
+    pages: str = Form(default=""),
+):
+    filename = safe_filename(file.filename)
+    validate_pdf_extension(filename)
+
+    work_dir = Path(tempfile.mkdtemp(prefix="pdf-to-images-"))
+    input_path = work_dir / (uuid.uuid4().hex + ".pdf")
+
+    try:
+        size = await save_upload(file, input_path)
+        if size <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Uploaded file is empty",
+            )
+        images = render_pdf_pages(input_path, pages)
+        return api_response(
+            0,
+            "ok",
+            {
+                "sourceFileName": filename,
+                "imageCount": len(images),
+                "images": images,
+            },
+        )
+    finally:
+        cleanup_paths([work_dir])
 
 
 @app.post("/document/convert-to-pdf", dependencies=[Depends(require_token)])
