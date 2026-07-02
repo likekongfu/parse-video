@@ -1,6 +1,6 @@
 # Document Converter Service
 
-Small FastAPI + LibreOffice service for converting local office documents to PDF.
+Small FastAPI service for converting local documents.
 It is designed to run as a separate container from the existing video parsing API.
 
 ## Endpoints
@@ -8,13 +8,20 @@ It is designed to run as a separate container from the existing video parsing AP
 - `GET /health`
 - `POST /document/word-to-pdf`
 - `POST /document/convert-to-pdf`
+- `POST /document/pdf-to-word`
 
-Both conversion endpoints accept multipart form-data:
+All conversion endpoints accept multipart form-data:
 
 ```bash
 curl -X POST http://127.0.0.1:8010/document/word-to-pdf \
   -F "file=@sample.docx" \
   --output sample.pdf
+```
+
+```bash
+curl -X POST http://127.0.0.1:8010/document/pdf-to-word \
+  -F "file=@sample.pdf" \
+  --output sample.docx
 ```
 
 If `DOCUMENT_CONVERTER_TOKEN` is set, add:
@@ -25,12 +32,17 @@ If `DOCUMENT_CONVERTER_TOKEN` is set, add:
 
 ## Supported Files
 
+Word to PDF:
 - `.docx`
 - `.doc`
 - `.rtf`
 - `.odt`
 
-The service uses LibreOffice headless mode, so it preserves layout much better than text-only conversion.
+PDF to Word:
+- `.pdf`
+
+Word to PDF uses LibreOffice headless mode, so it preserves layout much better than text-only conversion.
+PDF to Word uses `pdf2docx`, which works best for text-based PDFs. Scanned PDFs need a separate OCR flow.
 
 ## Docker
 

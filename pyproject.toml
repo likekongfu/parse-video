@@ -24,6 +24,9 @@ web = [
     "python-multipart>=0.0.20",
     "fastapi-mcp>=0.4",
 ]
+document = [
+    "pdf2docx>=0.5.12",
+]
 cli = [
     "typer>=0.12",
     "rich>=13.0",
@@ -37,7 +40,7 @@ dev = [
     "flake8>=7.0",
     "pre-commit>=3.7",
 ]
-all = ["parse-video-py[web,cli]"]
+all = ["parse-video-py[web,document,cli]"]
 
 [project.scripts]
 parse-video-py = "parse_video_py.cli:app"

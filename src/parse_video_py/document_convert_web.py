@@ -8,10 +8,12 @@ from typing import Iterable
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
+from pdf2docx import Converter
 from starlette.background import BackgroundTask
 
 
 ALLOWED_EXTENSIONS = {".doc", ".docx", ".rtf", ".odt"}
+PDF_EXTENSIONS = {".pdf"}
 MAX_UPLOAD_BYTES = int(os.getenv("DOCUMENT_CONVERTER_MAX_UPLOAD_BYTES", "15728640"))
 CONVERT_TIMEOUT_SECONDS = int(os.getenv("DOCUMENT_CONVERTER_TIMEOUT_SECONDS", "90"))
 LIBREOFFICE_BIN = os.getenv("LIBREOFFICE_BIN", "libreoffice")
@@ -62,6 +64,16 @@ def validate_extension(filename: str) -> str:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unsupported file type. Allowed: {allowed}",
+        )
+    return suffix
+
+
+def validate_pdf_extension(filename: str) -> str:
+    suffix = Path(filename).suffix.lower()
+    if suffix not in PDF_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported file type. Allowed: .pdf",
         )
     return suffix
 
@@ -130,6 +142,26 @@ def run_libreoffice(input_path: Path, output_dir: Path) -> Path:
     return pdf_path
 
 
+def run_pdf2docx(input_path: Path, output_path: Path) -> Path:
+    converter = Converter(str(input_path))
+    try:
+        converter.convert(str(output_path), start=0, end=None)
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(error)[-800:] or "PDF to Word conversion failed",
+        ) from error
+    finally:
+        converter.close()
+
+    if not output_path.exists() or output_path.stat().st_size <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="PDF to Word conversion failed",
+        )
+    return output_path
+
+
 def cleanup_paths(paths: Iterable[Path]) -> None:
     for path in paths:
         try:
@@ -149,6 +181,36 @@ def health_check() -> dict:
 @app.post("/document/word-to-pdf", dependencies=[Depends(require_token)])
 async def word_to_pdf(file: UploadFile = File(...)):
     return await convert_to_pdf(file)
+
+
+@app.post("/document/pdf-to-word", dependencies=[Depends(require_token)])
+async def pdf_to_word(file: UploadFile = File(...)):
+    filename = safe_filename(file.filename)
+    validate_pdf_extension(filename)
+
+    work_dir = Path(tempfile.mkdtemp(prefix="pdf-to-word-"))
+    input_path = work_dir / (uuid.uuid4().hex + ".pdf")
+    output_path = work_dir / (uuid.uuid4().hex + ".docx")
+
+    try:
+        size = await save_upload(file, input_path)
+        if size <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Uploaded file is empty",
+            )
+        docx_path = run_pdf2docx(input_path, output_path)
+        output_name = Path(filename).with_suffix(".docx").name
+        return FileResponse(
+            docx_path,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            filename=output_name,
+            background=BackgroundTask(cleanup_paths, [work_dir]),
+            headers={"Cache-Control": "no-store"},
+        )
+    except Exception:
+        cleanup_paths([work_dir])
+        raise
 
 
 @app.post("/document/convert-to-pdf", dependencies=[Depends(require_token)])
