@@ -1,227 +1,367 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+## 项目说明
 
-## Project Overview
+这是“龙天文件工坊”的 FastAPI 后端项目。
 
-This is a Python-based video parsing service that extracts video information from multiple Chinese social media platforms. It removes watermarks and provides direct video URLs from 20+ platforms including Douyin, Kuaishou, Weibo, Xiaohongshu, and others.
+当前后端可能包含：
 
-## Architecture
+- FastAPI
+- Docker
+- Nginx
+- LibreOffice Headless
+- FFmpeg
+- ffprobe
+- PyMuPDF
+- 其他文档或音视频处理模块
 
-Source code lives under `src/parse_video_py/` (hatchling build).
-
-- **Web** (`src/parse_video_py/web.py`): FastAPI app, routes, Basic Auth, MCP
-- **Parsers** (`src/parse_video_py/parser/`): 26 platform parsers inheriting `BaseParser`
-- **CLI** (`src/parse_video_py/cli/`): Typer commands (parse/serve/version)
-- **Utils** (`src/parse_video_py/utils.py`): URL extraction, query param parsing
-
-### Core Components
-
-**BaseParser** (`src/parse_video_py/parser/base.py`):
-- Abstract base class for all platform parsers
-- Defines `VideoSource` enum (26 platforms), `VideoInfo`, `VideoAuthor`, `ImgInfo` dataclasses
-- Subclasses must implement `parse_share_url()` and `parse_video_id()`
-
-**Parser Routing** (`src/parse_video_py/parser/__init__.py`):
-- `video_source_info_mapping`: VideoSource → domain_list + parser class
-- `parse_video_share_url()`: URL → domain match → parser → VideoInfo
-- `parse_video_id()`: VideoSource + ID → parser → VideoInfo
-
-## Development Commands
-
-### Local Development
-```bash
-# Create venv and install all dependencies (Python >= 3.10 required)
-uv venv && uv pip install -e ".[all]"
-
-# Install with optional groups
-uv pip install -e ".[web]"      # Web server only
-uv pip install -e ".[cli]"      # CLI only
-uv pip install -e ".[all,dev]"  # With dev tools
-
-# Activate venv
-source .venv/bin/activate
-
-# Run development server
-uvicorn main:app --reload
-
-# Run production server
-uvicorn main:app --host 0.0.0.0 --port 8000
-
-# CLI usage
-parse-video-py parse "https://v.douyin.com/xxx"
-parse-video-py parse "url1" "url2" --format json
-parse-video-py parse -f urls.txt
-parse-video-py serve --port 8000
-```
-
-### Code Quality
-The project uses pre-commit hooks with formatting tools:
-- **Black**: Code formatting (line length: 88)
-- **isort**: Import sorting (black-compatible profile)
-- **flake8**: Linting (max line length: 88)
-
-```bash
-# Install pre-commit hooks
-pre-commit install
-
-# Run formatting tools manually
-black .
-isort .
-flake8 .
-```
-
-**Note**: The actual flake8 configuration in `.pre-commit-config.yaml` shows max line length as 88, but some development uses 79. Follow existing patterns in each file.
-
-### Testing
-The project uses pytest with pytest-asyncio (`asyncio_mode = "auto"` in `pyproject.toml`):
-
-```bash
-# Run all tests
-pytest tests/ -v --tb=short
-
-# Run specific test files
-pytest tests/test_main.py         # API endpoint tests
-pytest tests/test_cli.py          # CLI command tests
-pytest tests/test_utils.py        # Utility function tests
-pytest tests/test_new_parsers_routing.py  # Parser routing tests
-pytest tests/test_cctv.py         # Platform-specific parser tests
-pytest tests/test_qqvideo.py
-pytest tests/test_sohu.py
-pytest tests/test_twitter.py
-
-# Run tests with coverage
-pytest --cov=parse_video_py
-```
-
-### Docker
-```bash
-# Build and run
-docker run -d -p 8000:8000 wujunwei928/parse-video-py
-
-# Run with basic auth
-docker run -d -p 8000:8000 -e PARSE_VIDEO_USERNAME=username -e PARSE_VIDEO_PASSWORD=password wujunwei928/parse-video-py
-```
-
-## API Endpoints
-
-- `GET /`: Web interface
-- `GET /video/share/url/parse?url=<share_url>`: Parse video from share URL
-- `GET /video/id/parse?source=<source>&video_id=<id>`: Parse video by ID
-- MCP endpoint: `http://localhost:8000/mcp` (via FastAPI-MCP in `web.py`)
-
-### Basic Auth
-Set environment variables to enable (unset = disabled):
-```bash
-export PARSE_VIDEO_USERNAME=username
-export PARSE_VIDEO_PASSWORD=password
-```
-
-## Important Notes
-
-- All parsers must handle both share URLs and video IDs
-- Default UA: `fake_useragent.UserAgent(os="iOS").random` (some parsers use `os="windows"`)
-- Video URLs should be direct, watermark-free when possible
-- 26 platforms support video, 5 also support image albums (Douyin, Kuaishou, Xiaohongshu, Pipixia, Weibo)
-- LivePhoto support: Douyin and Xiaohongshu
-- Image parsers should prioritize highest quality: large > original > bmiddle > url
-- Use app share links when possible; desktop web versions may not be fully tested
-- Auth uses `secrets.compare_digest()` — do not replace with plain string comparison
-- Platform-specific details (Douyin Live Photo, Weibo album, etc.) → see `docs/knowledge/03_core_flows.md`
-
-## Adding New Platforms
-
-1. Create `src/parse_video_py/parser/<name>.py` inheriting from `BaseParser`
-2. Add enum value to `VideoSource` in `base.py`
-3. Update `video_source_info_mapping` in `parser/__init__.py` with domain list and parser class
-4. Implement `parse_share_url()` and `parse_video_id()`
-5. Add tests in `tests/test_<name>.py`
-6. Update knowledge base: `02_project_map.md` + `99_global_index.md`
-
-## Direct Parser Usage
-
-```python
-import asyncio
-from parse_video_py import parse_video_share_url, parse_video_id, VideoSource
-
-# Parse from share URL
-video_info = asyncio.run(parse_video_share_url("share_url"))
-
-# Parse from video ID
-video_info = asyncio.run(parse_video_id(VideoSource.DouYin, "video_id"))
-```
-
-## Agent skills
-
-### Issue tracker
-
-Issues live in GitHub Issues for this repo. Use the `gh` CLI for all operations. See `docs/agents/issue-tracker.md`.
-
-### Triage labels
-
-Uses the default five-role triage label vocabulary (needs-triage, needs-info, ready-for-agent, ready-for-human, wontfix). See `docs/agents/triage-labels.md`.
-
-### Domain docs
-
-Single-context repo. Domain glossary at `CONTEXT.md` and ADRs at `docs/adr/` in the repo root. See `docs/agents/domain.md`.
+必须以项目真实代码为准，不得猜测不存在的目录、接口或服务。
 
 ---
 
-## AI 知识库使用规则（强制）
+## 核心规则
 
-> **IMPORTANT**: 本项目有 AI 编程知识库。任何代码修改前，必须先读取知识库中的相关文档。这不是建议，是硬性规则。违反此规则可能导致误改核心逻辑、破坏现有功能。
+- 每次只完成当前 Prompt 指定的一个功能或一个明确阶段。
+- 修改前先执行 `git status --short`。
+- 先阅读相关代码，确认现有结构后再修改。
+- 优先最小改动，不进行无关重构。
+- 不删除、覆盖或回退用户已有修改。
+- 不安装未经允许的新依赖。
+- 不自动 commit 或 push。
+- 未真实执行的测试不得声称通过。
+- 当前任务完成后停止，不自动进入下一阶段。
+- 无法确认时先说明，不得猜测后继续修改。
 
-### 知识库位置
-- 项目知识库：`docs/knowledge/`
-- **入口文件（必读）**：`docs/knowledge/00_ai_entry.md`
-- **全局索引（必读）**：`docs/knowledge/99_global_index.md`
+---
 
-### 强制工作流
+## 修改范围
 
-**每次接到任务时，执行以下步骤：**
+除非当前任务明确要求，否则不得：
 
-1. **先读** `docs/knowledge/99_global_index.md`，根据任务类型确定需要读哪些文档
-2. **再读**对应文档，理解相关流程和约束
-3. **然后**才开始编写或修改代码
-4. **最后**判断是否需要更新知识库
+- 修改其他独立服务
+- 修改无关路由
+- 修改数据库结构
+- 修改已有接口协议
+- 修改 Docker 网络或卷
+- 修改无关 Nginx 配置
+- 修改线上域名
+- 批量移动或重命名文件
+- 全项目格式化
+- 引入新的大型框架
+- 改写现有项目架构
 
-跳过步骤 1-2 直接修改代码是**被禁止的**。
+局部任务只修改必要文件，不顺便清理、抽象或重构其他模块。
 
-### 按任务类型的必读文档
+---
 
-| 任务类型 | 必须先读 | 原因 |
-|---|---|---|
-| 新增平台解析器 | 全局索引 → 核心流程 → 编码规则 | 确认解析器模式和路由注册 |
-| 修改解析逻辑 | 全局索引 → 核心流程 → 变更安全 | 确认影响范围 |
-| 修改鉴权 | 全局索引 → 变更安全 | Basic Auth 高风险区域 |
-| 新增接口 | 全局索引 → 核心流程 → 编码规则 | 确认路由和响应格式 |
-| 修 Bug | 全局索引 → 核心流程 | 理解上下文再修复 |
+## 文件编码
 
-### 高风险修改约束
+所有代码和配置文件保持：
 
-修改以下区域前**必须阅读变更安全文档**，否则禁止修改：
-- 解析器路由映射（`video_source_info_mapping`）
-- BaseParser 接口和数据结构（`VideoInfo`、`VideoSource`）
-- Web 鉴权逻辑
-- 部署配置/CI/CD
+- UTF-8
+- 无 BOM
+- LF 换行
 
-禁止事项：
-- 禁止一次性大范围重构稳定代码
-- 禁止删除未知用途代码
-- 禁止未确认调用方就改公共函数签名
-- 禁止把密钥写入代码
+包括：
 
-### 变更后知识库维护
+- `.py`
+- `.json`
+- `.yaml`
+- `.yml`
+- `.toml`
+- `.conf`
+- `.sh`
+- `Dockerfile`
+- `.md`
 
-代码发生以下变更后，必须同步更新对应的知识库文档：
-- 新增/删除解析器 → 项目地图 + 核心流程 + 全局索引
-- 修改 VideoInfo 结构 → 项目地图 + 核心流程
-- 修改鉴权逻辑 → 核心流程 + 变更安全
-- 新增环境变量 → 项目地图 + 构建部署 + 变更安全
-- 修改部署方式 → 构建部署 + 变更安全
+优先使用局部补丁，不整文件重写。
 
-### 不需要更新知识库的情况
-- 单个解析器内部逻辑微调
-- 无业务含义的样式调整
-- 局部 bugfix 且不改变流程
-- 测试用例补充但不改变规则
+发现以下情况时立即停止写入：
+
+- `�`
+- `锟斤拷`
+- 中文异常
+- 文件无法按 UTF-8 解码
+- 整个文件因换行或编码被无意义重写
+
+---
+
+## FastAPI 规范
+
+- 路由只负责参数接收、校验和响应。
+- 复杂业务逻辑放入 service。
+- 通用文件操作放入 utils。
+- 请求和响应结构放入 schemas。
+- 配置放入 config。
+- 不把全部转换逻辑写进单个路由函数。
+- 不向前端返回服务器绝对路径、完整异常堆栈或敏感配置。
+- 错误响应使用稳定、清晰的结构。
+- 所有异步或耗时操作必须考虑超时和异常恢复。
+
+建议错误结构：
+
+```json
+{
+  "success": false,
+  "code": "INVALID_FILE",
+  "message": "不支持该文件格式"
+}
+```
+
+---
+
+## 文件处理规范
+
+所有文件处理必须：
+
+- 使用 UUID 生成服务器文件名
+- 原始文件名只用于展示
+- 校验扩展名
+- 校验 MIME 类型
+- 必要时检测真实文件类型
+- 限制文件大小
+- 限制页数、时长、分辨率或其他资源消耗
+- 防止目录穿越
+- 输入文件和输出文件分目录存放
+- 转换失败后清理残留文件
+- 结果文件按策略定时删除
+- 下载接口只能访问允许目录
+- 文件不存在或已过期时返回明确错误
+
+不得：
+
+- 信任用户原始文件名
+- 把用户路径直接拼接到服务器路径
+- 把大文件转成 Base64 传输
+- 在响应中暴露内部路径
+
+---
+
+## 外部命令
+
+调用以下工具时：
+
+- FFmpeg
+- ffprobe
+- LibreOffice
+- 其他系统命令
+
+必须：
+
+- 使用参数数组
+- 禁止 `shell=True`
+- 设置执行超时
+- 检查返回码
+- 捕获标准输出和错误输出
+- 检查输出文件真实存在且非空
+- 参数使用白名单
+- 不允许用户直接传入命令参数、编码器或滤镜表达式
+- 失败后清理输入和输出残留
+- 不把完整命令、内部路径或完整错误堆栈返回前端
+
+涉及音视频时应确认：
+
+```bash
+ffmpeg -version
+ffprobe -version
+```
+
+涉及文档转换时应确认：
+
+```bash
+libreoffice --version
+```
+
+---
+
+## Docker 规范
+
+除非当前任务明确要求，否则不要修改 Docker 配置。
+
+修改 Docker 时必须：
+
+- 不破坏其他容器
+- 不修改无关网络
+- 不修改无关卷
+- 不修改无关端口
+- 服务监听 `0.0.0.0`
+- 确保数据目录可写
+- 确保所需系统工具真实安装
+- 提供或保留健康检查
+- 清理包管理缓存
+- 不把密钥写进镜像
+- 不因镜像构建成功就声称业务功能成功
+
+必须区分：
+
+- 镜像构建成功
+- 容器启动成功
+- 健康检查通过
+- 真实业务接口通过
+
+---
+
+## Nginx 规范
+
+除非当前任务明确要求，否则不要修改 Nginx。
+
+修改时必须：
+
+- 只修改任务相关的 `location`
+- 不删除已有代理
+- 不破坏其他服务
+- 根据上传需求设置合理的：
+  - `client_max_body_size`
+  - `proxy_connect_timeout`
+  - `proxy_read_timeout`
+  - `proxy_send_timeout`
+
+修改后必须执行：
+
+```bash
+nginx -t
+```
+
+只有语法检查通过后才能 reload。
+
+必须明确区分：
+
+- Nginx 语法通过
+- 后端健康检查通过
+- 真实业务接口通过
+
+三者不能混为一谈。
+
+---
+
+## Git 安全
+
+未经用户明确要求，禁止：
+
+- `git reset --hard`
+- `git clean -fd`
+- `git checkout -- .`
+- 自动 commit
+- 自动 push
+- 强制推送
+- 修改历史提交
+- 删除未提交文件
+
+发现以下冲突标记时立即停止：
+
+- `<<<<<<<`
+- `=======`
+- `>>>>>>>`
+
+如果用户没有要求提交，只提供建议的 commit message。
+
+---
+
+## 测试真实性
+
+必须区分以下层级：
+
+1. Python 语法检查
+2. 模块导入检查
+3. 单元测试
+4. 服务启动
+5. Docker 容器启动
+6. 健康检查
+7. curl 真实文件测试
+8. 输出文件类型检查
+9. 输出文件实际打开检查
+10. 线上接口验证
+11. 小程序联调
+
+没有真实执行的测试，不得写：
+
+- 测试通过
+- 接口可用
+- 部署成功
+- 转换成功
+- 线上正常
+
+应如实写：
+
+- 仅完成静态检查
+- 尚未启动容器
+- 尚未使用真实文件测试
+- 尚未验证输出文件
+- 尚未进行线上接口测试
+- 尚未完成小程序联调
+
+---
+
+## 完成后检查
+
+每次任务完成前至少执行：
+
+- Python 语法或模块导入检查
+- 相关接口测试
+- `git diff --check`
+- `git diff`
+
+并确认：
+
+- 没有越界修改
+- 没有无关重构
+- 没有安装未授权依赖
+- 没有乱码
+- 没有整文件异常重写
+- 临时文件和异常状态得到清理
+- 未验证事项已如实说明
+- 没有自动进入下一阶段
+
+---
+
+## 最终回复格式
+
+每次任务完成后按以下结构汇报：
+
+```markdown
+## 执行结果
+
+状态：成功 / 部分完成 / 失败
+
+## 修改文件
+
+- `路径/文件`：修改内容
+
+## 核心改动
+
+- 改动 1
+- 改动 2
+
+## 已执行检查
+
+- `[通过/失败/未执行]` Python 语法检查
+- `[通过/失败/未执行]` 模块导入检查
+- `[通过/失败/未执行]` 接口测试
+- `[通过/失败/未执行]` 文件输出检查
+- `[通过/失败/未执行]` 乱码检查
+- `[通过/失败/未执行]` git diff 自查
+
+## 运行验证
+
+- 服务启动：已验证 / 未验证
+- Docker 容器：已验证 / 未验证
+- 健康检查：已验证 / 未验证
+- curl 真实文件测试：已验证 / 未验证
+- 输出文件打开：已验证 / 未验证
+- 线上接口：已验证 / 未验证
+- 小程序联调：已验证 / 未验证
+
+## 风险或遗留问题
+
+- 无
+
+或：
+
+- 明确列出问题
+
+## 建议提交信息
+
+`commit message`
+```
+
+完成汇报后停止，不自动继续下一阶段。
