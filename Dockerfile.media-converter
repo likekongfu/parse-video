@@ -1,0 +1,40 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DISABLE_DOCS=false \
+    MEDIA_CONVERTER_MAX_UPLOAD_BYTES=104857600 \
+    MEDIA_CONVERTER_MAX_DURATION_SECONDS=600 \
+    MEDIA_CONVERTER_TIMEOUT_SECONDS=300 \
+    MEDIA_CONVERTER_PROBE_TIMEOUT_SECONDS=30 \
+    MEDIA_CONVERTER_OUTPUT_TTL_SECONDS=7200 \
+    MEDIA_CONVERTER_PUBLIC_BASE_URL="" \
+    MEDIA_CONVERTER_TOKEN="" \
+    FFMPEG_BIN=ffmpeg \
+    FFPROBE_BIN=ffprobe
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml README.md ./
+COPY src/ ./src/
+
+RUN python -m pip install --upgrade pip \
+    && python -m pip install ".[web]" \
+    && useradd --create-home --shell /usr/sbin/nologin appuser \
+    && mkdir -p data/media-upload data/media-output \
+    && chown -R appuser:appuser /app
+
+USER appuser
+
+EXPOSE 8020
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8020/health', timeout=3).read()" || exit 1
+
+CMD ["uvicorn", "parse_video_py.media_convert_web:app", "--host", "0.0.0.0", "--port", "8020"]
