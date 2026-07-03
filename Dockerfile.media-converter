@@ -11,6 +11,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     MEDIA_CONVERTER_OUTPUT_TTL_SECONDS=7200 \
     MEDIA_CONVERTER_PUBLIC_BASE_URL="" \
     MEDIA_CONVERTER_TOKEN="" \
+    MEDIA_WATERMARK_TIMEOUT_SECONDS=300 \
+    MEDIA_WATERMARK_FONT_FILE=/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc \
     FFMPEG_BIN=ffmpeg \
     FFPROBE_BIN=ffprobe
 
@@ -19,6 +21,7 @@ WORKDIR /app
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg \
+        fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md ./
