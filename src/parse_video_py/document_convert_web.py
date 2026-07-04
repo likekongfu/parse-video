@@ -1,4 +1,3 @@
-import base64
 import os
 import shutil
 import subprocess
@@ -30,6 +29,12 @@ DISABLE_DOCS = os.getenv("DISABLE_DOCS", "").strip().lower() in {
     "yes",
     "on",
 }
+
+# 输出 / 下载配置
+OUTPUT_DIR = Path(os.getenv("DOCUMENT_CONVERTER_OUTPUT_DIR", "data/document-output"))
+PUBLIC_BASE_URL = os.getenv("DOCUMENT_CONVERTER_PUBLIC_BASE_URL", "").strip().rstrip("/")
+OUTPUT_TTL_SECONDS = int(os.getenv("DOCUMENT_CONVERTER_OUTPUT_TTL_SECONDS", "7200"))
+ALLOWED_DOWNLOAD_EXTENSIONS: set[str] = {".png", ".jpg", ".jpeg"}
 
 app = FastAPI(
     title="Document Converter Service",
@@ -198,7 +203,9 @@ def run_pdf2docx(input_path: Path, output_path: Path) -> Path:
     return output_path
 
 
-def render_pdf_pages(input_path: Path, page_range: str | None) -> list[dict]:
+def render_pdf_pages(
+    input_path: Path, page_range: str | None, output_dir: Path
+) -> list[dict]:
     try:
         import fitz
     except ImportError as error:
@@ -215,6 +222,7 @@ def render_pdf_pages(input_path: Path, page_range: str | None) -> list[dict]:
             detail=str(error)[-800:] or "Failed to open PDF",
         ) from error
 
+    written_files: list[Path] = []
     try:
         total_pages = document.page_count
         pages = parse_page_range(page_range, total_pages)
@@ -242,16 +250,35 @@ def render_pdf_pages(input_path: Path, page_range: str | None) -> list[dict]:
                     status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                     detail="Rendered images are too large, please select fewer pages",
                 )
+
+            # 写入输出目录，UUID 文件名
+            server_name = uuid.uuid4().hex + ".png"
+            image_path = output_dir / server_name
+            image_path.write_bytes(image_bytes)
+            written_files.append(image_path)
+
+            download_url = ""
+            if PUBLIC_BASE_URL:
+                download_url = f"{PUBLIC_BASE_URL}/files/{server_name}"
+
             images.append(
                 {
                     "page": page_no,
                     "name": f"pdf-page-{page_no}-{index}.png",
-                    "mimeType": "image/png",
+                    "imageType": "png",
                     "size": len(image_bytes),
-                    "base64": base64.b64encode(image_bytes).decode("ascii"),
+                    "downloadUrl": download_url,
                 }
             )
         return images
+    except Exception:
+        # 渲染失败时清理已写入的图片文件
+        for fp in written_files:
+            try:
+                fp.unlink()
+            except OSError:
+                pass
+        raise
     finally:
         document.close()
 
@@ -265,6 +292,91 @@ def cleanup_paths(paths: Iterable[Path]) -> None:
                 path.unlink()
         except OSError:
             pass
+
+
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def cleanup_expired_outputs() -> int:
+    """删除超过 TTL 的输出图片。返回删除数量。"""
+    ensure_dir(OUTPUT_DIR)
+    now = __import__("time").time()
+    removed = 0
+    for entry in OUTPUT_DIR.iterdir():
+        if not entry.is_file():
+            continue
+        try:
+            if now - entry.stat().st_mtime >= OUTPUT_TTL_SECONDS:
+                entry.unlink()
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def validate_download_filename(filename: str) -> str:
+    """下载接口安全校验：禁止目录穿越，只允许白名单后缀。"""
+    name = Path(filename).name
+    if name != filename:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid filename",
+        )
+    if ".." in name or "/" in name or "\\" in name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid filename",
+        )
+    suffix = Path(name).suffix.lower()
+    if suffix not in ALLOWED_DOWNLOAD_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Only {', '.join(sorted(ALLOWED_DOWNLOAD_EXTENSIONS))} files are allowed",
+        )
+    return name
+
+
+@app.get("/files/{filename}", dependencies=[Depends(require_token)])
+async def download_file(filename: str):
+    # ---- 1. 安全校验 ----
+    safe_name = validate_download_filename(filename)
+
+    # ---- 2. 查找文件 ----
+    file_path = OUTPUT_DIR / safe_name
+    resolved = file_path.resolve()
+    allowed = OUTPUT_DIR.resolve()
+    if not str(resolved).startswith(str(allowed) + os.sep) and resolved != allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied",
+        )
+
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File not found or expired",
+        )
+
+    # ---- 3. 确定 Content-Type ----
+    suffix = file_path.suffix.lower()
+    if suffix in {".jpg", ".jpeg"}:
+        media_type = "image/jpeg"
+    else:
+        media_type = "image/png"
+
+    return FileResponse(
+        file_path,
+        media_type=media_type,
+        filename=safe_name,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    ensure_dir(OUTPUT_DIR)
+    cleanup_expired_outputs()
 
 
 @app.get("/health", include_in_schema=False)
@@ -325,7 +437,9 @@ async def pdf_to_images(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Uploaded file is empty",
             )
-        images = render_pdf_pages(input_path, pages)
+        ensure_dir(OUTPUT_DIR)
+        images = render_pdf_pages(input_path, pages, OUTPUT_DIR)
+        cleanup_expired_outputs()
         return api_response(
             0,
             "ok",
