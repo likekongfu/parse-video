@@ -57,6 +57,16 @@ WATERMARK_FONT_FILE: str = os.getenv(
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
 )
 
+# ---- GIF 转换配置 ----
+ALLOWED_GIF_WIDTHS: set[int] = {360, 480}
+ALLOWED_GIF_FPS: set[int] = {5, 10, 15}
+MAX_GIF_DURATION_SECONDS: int = int(
+    os.getenv("MEDIA_CONVERTER_MAX_GIF_DURATION_SECONDS", "10")
+)
+GIF_CONVERT_TIMEOUT_SECONDS: int = int(
+    os.getenv("MEDIA_CONVERTER_GIF_TIMEOUT_SECONDS", "120")
+)
+
 API_TOKEN: str = os.getenv("MEDIA_CONVERTER_TOKEN", "").strip()
 DISABLE_DOCS: bool = os.getenv("DISABLE_DOCS", "").strip().lower() in {
     "1", "true", "yes", "on",
@@ -133,7 +143,15 @@ _ERROR_CODE_MAP: list[tuple[str, str, str]] = [
     ("ffmpeg is not installed", "PROCESS_FAILED", "Server processing capability unavailable"),
     ("Invalid converter token", "UNAUTHORIZED", "Invalid converter token"),
     ("Invalid filename", "INVALID_FILENAME", "Invalid filename"),
-    ("Only .mp3 and .m4a", "INVALID_FORMAT", "Only .mp3, .m4a and .mp4 files are allowed"),
+    ("Only .mp3 and .m4a", "INVALID_FORMAT", "Only .mp3, .m4a, .mp4 and .gif files are allowed"),
+    ("Invalid start time", "INVALID_START_TIME", "Start time must be >= 0"),
+    ("Invalid GIF duration", "INVALID_GIF_DURATION", "GIF duration must be 1-10 seconds"),
+    ("Invalid GIF width", "INVALID_GIF_WIDTH", "Width must be 360 or 480"),
+    ("Invalid GIF fps", "INVALID_GIF_FPS", "FPS must be 5, 10, or 15"),
+    ("Clip range exceeds video duration", "DURATION_EXCEEDED", "Clip range exceeds video duration"),
+    ("GIF conversion failed", "PROCESS_FAILED", "GIF conversion failed"),
+    ("GIF conversion produced no output", "PROCESS_FAILED", "GIF conversion produced no output"),
+    ("GIF conversion timed out", "PROCESS_TIMEOUT", "GIF conversion timed out"),
     ("File not found or expired", "FILE_EXPIRED", "File not found or expired"),
     ("Access denied", "ACCESS_DENIED", "Access denied"),
 ]
@@ -212,10 +230,10 @@ def validate_safe_filename(filename: str) -> str:
             detail="Invalid filename",
         )
     suffix = Path(name).suffix.lower()
-    if suffix not in {".mp3", ".m4a", ".mp4"}:
+    if suffix not in {".mp3", ".m4a", ".mp4", ".gif"}:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only .mp3, .m4a and .mp4 files are allowed",
+            detail="Only .mp3, .m4a, .mp4 and .gif files are allowed",
         )
     return name
 
@@ -530,6 +548,66 @@ def probe_video_basic(input_path: Path) -> dict[str, Any]:
     }
 
 
+def probe_video_for_gif(
+    input_path: Path, start_time: float, clip_duration: float
+) -> dict[str, Any]:
+    """
+    使用 ffprobe 校验视频用于 GIF 转换：
+    有效媒体、包含视频流、时长不超过上限、
+    截取范围不超出视频总时长。
+    不要求音频流。
+    """
+    info = _run_ffprobe(input_path)
+
+    streams: list[dict[str, Any]] = info.get("streams", [])
+    if not streams:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="No streams found in media file",
+        )
+
+    video_streams = [s for s in streams if s.get("codec_type") == "video"]
+    if not video_streams:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="File does not contain a video stream",
+        )
+
+    duration_str = info.get("format", {}).get("duration")
+    if duration_str is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Cannot determine media duration",
+        )
+    try:
+        duration_sec = float(duration_str)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Cannot determine media duration",
+        )
+
+    if duration_sec > MAX_VIDEO_DURATION_SECONDS:
+        minutes = MAX_VIDEO_DURATION_SECONDS // 60
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Video duration exceeds {minutes} minutes limit",
+        )
+
+    if start_time + clip_duration > duration_sec:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Clip range exceeds video duration",
+        )
+
+    return {
+        "duration": duration_sec,
+        "video_codec": video_streams[0].get("codec_name", "unknown"),
+        "width": video_streams[0].get("width"),
+        "height": video_streams[0].get("height"),
+    }
+
+
 # ---------------------------------------------------------------------------
 # FFmpeg 转码
 # ---------------------------------------------------------------------------
@@ -588,6 +666,87 @@ def run_ffmpeg(input_path: Path, output_path: Path, output_format: str) -> Path:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Audio extraction produced no output",
+        )
+
+    return output_path
+
+
+# ---------------------------------------------------------------------------
+# FFmpeg GIF 转换
+# ---------------------------------------------------------------------------
+
+def _build_gif_command(
+    input_path: Path,
+    output_path: Path,
+    start_time: float,
+    duration: float,
+    width: int,
+    fps: int,
+) -> list[str]:
+    """构建视频转 GIF 的 FFmpeg 参数数组。
+
+    使用 palettegen/paletteuse 两阶段滤镜生成高质量 GIF。
+    """
+    vf = (
+        f"fps={fps},"
+        f"scale={width}:-1:flags=lanczos,"
+        f"split[s0][s1];"
+        f"[s0]palettegen=max_colors=256:stats_mode=diff[p];"
+        f"[s1][p]paletteuse=dither=bayer:bayer_scale=5"
+    )
+    return [
+        FFMPEG_BIN,
+        "-y",
+        "-ss", str(start_time),
+        "-t", str(duration),
+        "-i", str(input_path),
+        "-vf", vf,
+        str(output_path),
+    ]
+
+
+def run_gif_ffmpeg(
+    input_path: Path,
+    output_path: Path,
+    start_time: float,
+    duration: float,
+    width: int,
+    fps: int,
+) -> Path:
+    """执行视频转 GIF。"""
+    command = _build_gif_command(
+        input_path, output_path, start_time, duration, width, fps
+    )
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=GIF_CONVERT_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="ffmpeg is not installed or FFMPEG_BIN is invalid",
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="GIF conversion timed out",
+        )
+
+    if result.returncode != 0:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="GIF conversion failed",
+        )
+
+    if not output_path.exists() or output_path.stat().st_size <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="GIF conversion produced no output",
         )
 
     return output_path
@@ -903,6 +1062,94 @@ async def add_text_watermark(
     })
 
 
+@app.post("/media/video/to-gif", dependencies=[Depends(require_token)])
+async def video_to_gif(
+    file: UploadFile = File(...),
+    start_time: float = Form(...),
+    duration: float = Form(...),
+    width: int = Form(...),
+    fps: int = Form(...),
+):
+    # ---- 1. 参数校验 ----
+    display_name = safe_display_name(file.filename)
+    validate_input_extension(display_name)
+
+    if start_time < 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid start time",
+        )
+    if duration <= 0 or duration > MAX_GIF_DURATION_SECONDS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid GIF duration",
+        )
+    if width not in ALLOWED_GIF_WIDTHS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid GIF width",
+        )
+    if fps not in ALLOWED_GIF_FPS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid GIF fps",
+        )
+
+    # ---- 2. 保存上传文件（分块写入） ----
+    ensure_dir(UPLOAD_DIR)
+    server_filename = uuid.uuid4().hex
+    input_suffix = Path(display_name).suffix.lower()
+    input_path = UPLOAD_DIR / (server_filename + input_suffix)
+
+    try:
+        size = await save_upload(file, input_path)
+        if size <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Uploaded file is empty",
+            )
+    except HTTPException:
+        cleanup_paths([input_path])
+        raise
+
+    # ---- 3. ffprobe 校验视频和截取范围 ----
+    try:
+        media_info = probe_video_for_gif(input_path, start_time, duration)
+    except HTTPException:
+        cleanup_paths([input_path])
+        raise
+
+    # ---- 4. FFmpeg 生成 GIF ----
+    ensure_dir(OUTPUT_DIR)
+    output_filename = server_filename + ".gif"
+    output_path = OUTPUT_DIR / output_filename
+
+    try:
+        run_gif_ffmpeg(input_path, output_path, start_time, duration, width, fps)
+    except HTTPException:
+        cleanup_paths([input_path, output_path])
+        raise
+
+    # ---- 5. 清理输入视频 ----
+    cleanup_paths([input_path])
+
+    # ---- 6. 清理过期输出 ----
+    cleanup_expired_outputs()
+
+    # ---- 7. 构造响应 ----
+    download_url = ""
+    if PUBLIC_BASE_URL:
+        download_url = f"{PUBLIC_BASE_URL}/files/{output_filename}"
+
+    output_display = Path(display_name).stem + ".gif"
+
+    return api_success({
+        "filename": output_display,
+        "download_url": download_url,
+        "expires_in": OUTPUT_TTL_SECONDS,
+    })
+
+
 @app.get("/files/{filename}", dependencies=[Depends(require_token)])
 async def download_file(filename: str):
     # ---- 1. 安全校验 ----
@@ -931,6 +1178,8 @@ async def download_file(filename: str):
         media_type = "audio/mpeg"
     elif suffix == ".mp4":
         media_type = "video/mp4"
+    elif suffix == ".gif":
+        media_type = "image/gif"
     else:
         media_type = "audio/mp4"
 
