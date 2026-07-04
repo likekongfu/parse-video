@@ -34,7 +34,7 @@ DISABLE_DOCS = os.getenv("DISABLE_DOCS", "").strip().lower() in {
 OUTPUT_DIR = Path(os.getenv("DOCUMENT_CONVERTER_OUTPUT_DIR", "data/document-output"))
 PUBLIC_BASE_URL = os.getenv("DOCUMENT_CONVERTER_PUBLIC_BASE_URL", "").strip().rstrip("/")
 OUTPUT_TTL_SECONDS = int(os.getenv("DOCUMENT_CONVERTER_OUTPUT_TTL_SECONDS", "7200"))
-ALLOWED_DOWNLOAD_EXTENSIONS: set[str] = {".png", ".jpg", ".jpeg"}
+ALLOWED_DOWNLOAD_EXTENSIONS: set[str] = {".png", ".jpg", ".jpeg", ".pdf", ".docx"}
 
 app = FastAPI(
     title="Document Converter Service",
@@ -362,6 +362,10 @@ async def download_file(filename: str):
     suffix = file_path.suffix.lower()
     if suffix in {".jpg", ".jpeg"}:
         media_type = "image/jpeg"
+    elif suffix == ".pdf":
+        media_type = "application/pdf"
+    elif suffix == ".docx":
+        media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     else:
         media_type = "image/png"
 
@@ -386,7 +390,56 @@ def health_check() -> dict:
 
 @app.post("/document/word-to-pdf", dependencies=[Depends(require_token)])
 async def word_to_pdf(file: UploadFile = File(...)):
-    return await convert_to_pdf(file)
+    filename = safe_filename(file.filename)
+    validate_extension(filename)
+
+    work_dir = Path(tempfile.mkdtemp(prefix="word-to-pdf-"))
+    input_path = work_dir / (uuid.uuid4().hex + Path(filename).suffix.lower())
+    server_name = uuid.uuid4().hex + ".pdf"
+    ensure_dir(OUTPUT_DIR)
+    output_path = OUTPUT_DIR / server_name
+
+    try:
+        size = await save_upload(file, input_path)
+        if size <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Uploaded file is empty",
+            )
+        # LibreOffice 输出到临时目录，再移动到 OUTPUT_DIR
+        temp_output_dir = work_dir / "out"
+        temp_output_dir.mkdir(parents=True, exist_ok=True)
+        temp_pdf = run_libreoffice(input_path, temp_output_dir)
+        # 移动到 OUTPUT_DIR 并重命名为 UUID
+        shutil.move(str(temp_pdf), str(output_path))
+        file_size = output_path.stat().st_size
+        output_name = Path(filename).with_suffix(".pdf").name
+
+        download_url = ""
+        if PUBLIC_BASE_URL:
+            download_url = f"{PUBLIC_BASE_URL}/files/{server_name}"
+
+        cleanup_expired_outputs()
+        return api_response(
+            0,
+            "ok",
+            {
+                "fileName": output_name,
+                "size": file_size,
+                "downloadUrl": download_url,
+                "expiresIn": OUTPUT_TTL_SECONDS,
+            },
+        )
+    except Exception:
+        # 转换失败时清理残留输出文件（输入由 finally 统一清理）
+        try:
+            output_path.unlink()
+        except OSError:
+            pass
+        raise
+    finally:
+        # 输入文件转换结束后立即删除
+        cleanup_paths([work_dir])
 
 
 @app.post("/document/pdf-to-word", dependencies=[Depends(require_token)])
@@ -396,7 +449,9 @@ async def pdf_to_word(file: UploadFile = File(...)):
 
     work_dir = Path(tempfile.mkdtemp(prefix="pdf-to-word-"))
     input_path = work_dir / (uuid.uuid4().hex + ".pdf")
-    output_path = work_dir / (uuid.uuid4().hex + ".docx")
+    server_name = uuid.uuid4().hex + ".docx"
+    ensure_dir(OUTPUT_DIR)
+    output_path = OUTPUT_DIR / server_name
 
     try:
         size = await save_upload(file, input_path)
@@ -406,17 +461,34 @@ async def pdf_to_word(file: UploadFile = File(...)):
                 detail="Uploaded file is empty",
             )
         docx_path = run_pdf2docx(input_path, output_path)
+        file_size = docx_path.stat().st_size
         output_name = Path(filename).with_suffix(".docx").name
-        return FileResponse(
-            docx_path,
-            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            filename=output_name,
-            background=BackgroundTask(cleanup_paths, [work_dir]),
-            headers={"Cache-Control": "no-store"},
+
+        download_url = ""
+        if PUBLIC_BASE_URL:
+            download_url = f"{PUBLIC_BASE_URL}/files/{server_name}"
+
+        cleanup_expired_outputs()
+        return api_response(
+            0,
+            "ok",
+            {
+                "fileName": output_name,
+                "size": file_size,
+                "downloadUrl": download_url,
+                "expiresIn": OUTPUT_TTL_SECONDS,
+            },
         )
     except Exception:
-        cleanup_paths([work_dir])
+        # 转换失败时清理残留输出文件（输入由 finally 统一清理）
+        try:
+            output_path.unlink()
+        except OSError:
+            pass
         raise
+    finally:
+        # 输入文件转换结束后立即删除
+        cleanup_paths([work_dir])
 
 
 @app.post("/document/pdf-to-images", dependencies=[Depends(require_token)])
