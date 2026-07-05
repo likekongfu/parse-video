@@ -15,6 +15,7 @@ from parse_video_py.content_security import (
     WxSecurityError,
     WxSecurityServiceError,
     check_image,
+    check_audio,
     get_task_store,
     verify_openid_token,
     handle_callback_url_verification,
@@ -933,13 +934,42 @@ def health_check() -> dict[str, str]:
 async def extract_audio(
     file: UploadFile = File(...),
     output_format: str = Form(default="mp3"),
+    openid_token: str = Form(default=""),
 ):
     # ---- 1. 基础校验 ----
     display_name = safe_display_name(file.filename)
     validate_input_extension(display_name)
     fmt = validate_output_format(output_format)
 
-    # ---- 2. 保存上传文件（分块写入） ----
+    # ---- 2. 内容安全开启时验证 openid_token ----
+    verified_openid = ""
+    if _SEC_ENABLED:
+        if not openid_token or not openid_token.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="内容安全已开启，openid_token 不能为空",
+            )
+
+        try:
+            verified_openid = verify_openid_token(openid_token)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"openid_token 无效: {exc}",
+            )
+        except WxSecurityError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"openid 验证服务异常: {exc.message}",
+            )
+
+        if not PUBLIC_BASE_URL:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="内容安全已开启但 PUBLIC_BASE_URL 未配置，无法提交异步审核",
+            )
+
+    # ---- 3. 保存上传视频 ----
     ensure_dir(UPLOAD_DIR)
     server_filename = uuid.uuid4().hex
     input_suffix = Path(display_name).suffix.lower()
@@ -953,46 +983,193 @@ async def extract_audio(
                 detail="Uploaded file is empty",
             )
     except HTTPException:
-        # 上传失败时清理已写入的部分
         cleanup_paths([input_path])
         raise
 
-    # ---- 3. ffprobe 深度校验 ----
+    # ---- 4. ffprobe 深度校验 ----
     try:
-        media_info = probe_and_validate(input_path)
+        probe_and_validate(input_path)
     except HTTPException:
         cleanup_paths([input_path])
         raise
 
-    # ---- 4. FFmpeg 转码 ----
+    # ---- 5. 生成用户最终音频 ----
     ensure_dir(OUTPUT_DIR)
     output_filename = server_filename + "." + fmt
     output_path = OUTPUT_DIR / output_filename
 
+    # MP3 直接审核最终文件；M4A 额外生成临时 MP3 用于审核。
+    review_filename = output_filename
+    review_path = output_path
+
     try:
         run_ffmpeg(input_path, output_path, fmt)
+
+        if _SEC_ENABLED and fmt == "m4a":
+            review_filename = server_filename + "_review.mp3"
+            review_path = OUTPUT_DIR / review_filename
+            run_ffmpeg(input_path, review_path, "mp3")
     except HTTPException:
-        # 失败时清理输入视频 和 可能残留的输出文件
-        cleanup_paths([input_path, output_path])
+        cleanup_paths([input_path, output_path, review_path])
         raise
 
-    # ---- 5. 清理输入视频 ----
+    # ---- 6. 清理原始上传视频 ----
     cleanup_paths([input_path])
 
-    # ---- 6. 清理过期输出 ----
+    output_display = Path(display_name).with_suffix("." + fmt).name
+
+    # ---- 7. 提交微信音频内容安全审核 ----
+    job_id = server_filename
+    trace_id = ""
+    is_pending = False
+
+    if _SEC_ENABLED and verified_openid:
+        review_url = f"{PUBLIC_BASE_URL}/files/{review_filename}"
+
+        try:
+            result = check_audio(
+                media_url=review_url,
+                openid=verified_openid,
+            )
+            trace_id = result.trace_id
+
+            if not trace_id:
+                raise WxSecurityServiceError(
+                    "微信音频内容安全接口未返回 trace_id"
+                )
+
+            task_store = get_task_store()
+            task_store.create_task(
+                job_id=job_id,
+                trace_id=trace_id,
+                file_path=str(output_path),
+                openid=verified_openid,
+                media_url=review_url,
+                media_type="audio",
+            )
+            is_pending = True
+
+        except (WxSecurityError, ValueError) as exc:
+            log = __import__("logging").getLogger(__name__)
+            log.exception(
+                "[audio-audit] 内容安全提交失败 "
+                "job_id=%s errcode=%s code=%s message=%s",
+                job_id,
+                getattr(exc, "errcode", None),
+                getattr(exc, "code", None),
+                getattr(exc, "message", str(exc)),
+            )
+
+            # 临时审核 MP3 已无用途。
+            if review_path != output_path:
+                cleanup_paths([review_path])
+
+            if _SEC_STRICT:
+                cleanup_paths([output_path])
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="内容安全服务异常，请稍后重试",
+                )
+
+            # 非严格模式：保持 GIF 当前行为，审核提交失败时直接放行。
+            is_pending = False
+
+    # ---- 8. 清理过期输出 ----
     cleanup_expired_outputs()
 
-    # ---- 7. 构造响应 ----
+    # ---- 9. 审核提交成功：返回 pending ----
+    if is_pending:
+        return api_success({
+            "jobId": job_id,
+            "status": "pending",
+            "filename": output_display,
+            "traceId": trace_id,
+            "message": "音频已生成，内容安全审核中，请稍后查询",
+        })
+
+    # ---- 10. 未开启审核或非严格模式放行 ----
     download_url = ""
     if PUBLIC_BASE_URL:
         download_url = f"{PUBLIC_BASE_URL}/files/{output_filename}"
-
-    output_display = Path(display_name).with_suffix("." + fmt).name
 
     return api_success({
         "filename": output_display,
         "download_url": download_url,
         "expires_in": OUTPUT_TTL_SECONDS,
+    })
+
+
+@app.get(
+    "/media/video/extract-audio/status/{job_id}",
+    dependencies=[Depends(require_token)],
+)
+async def extract_audio_status(job_id: str):
+    """查询音频提取任务的内容安全审核状态。"""
+
+    task_store = get_task_store()
+    task = task_store.get_task(job_id)
+
+    if task is None or task.media_type != "audio":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="任务不存在或已过期",
+        )
+
+    final_path = Path(task.file_path)
+    file_name = final_path.name
+
+    if task.status == "approved":
+        if not final_path.exists() or not final_path.is_file():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="File not found or expired",
+            )
+
+        download_url = ""
+        if PUBLIC_BASE_URL:
+            download_url = f"{PUBLIC_BASE_URL}/files/{file_name}"
+
+        return api_success({
+            "jobId": job_id,
+            "status": "approved",
+            "filename": file_name,
+            "downloadUrl": download_url,
+            "expiresIn": OUTPUT_TTL_SECONDS,
+            "traceId": task.trace_id,
+        })
+
+    if task.status == "rejected":
+        return api_success({
+            "jobId": job_id,
+            "status": "rejected",
+            "filename": file_name,
+            "downloadUrl": "",
+            "message": "内容安全审核不通过，输出文件已删除",
+            "traceId": task.trace_id,
+            "result": task.result,
+        })
+
+    if task.status in {"error", "expired"}:
+        message = "审核失败或任务已过期"
+        if task.result:
+            message = task.result.get("message", message)
+
+        return api_success({
+            "jobId": job_id,
+            "status": "error",
+            "filename": file_name,
+            "downloadUrl": "",
+            "message": message,
+            "traceId": task.trace_id,
+        })
+
+    return api_success({
+        "jobId": job_id,
+        "status": "pending",
+        "filename": file_name,
+        "downloadUrl": "",
+        "message": "内容安全审核中，请稍后查询",
+        "traceId": task.trace_id,
     })
 
 
@@ -1370,7 +1547,6 @@ async def wx_callback_event(request: Request):
             detail="请求体为空",
         )
 
-    # 从 URL 参数获取签名信息
     params = request.query_params
     msg_signature = params.get("msg_signature", "")
     timestamp = params.get("timestamp", "")
@@ -1383,7 +1559,17 @@ async def wx_callback_event(request: Request):
         nonce=nonce,
     )
 
-    # 无论解析结果如何，都返回 "success" 以告知微信服务器停止重试
+    # M4A 使用临时 MP3 审核；收到结果后立即清理临时文件。
+    if result and result.trace_id:
+        task_store = get_task_store()
+        task = task_store.get_task_by_trace_id(result.trace_id)
+        if task and task.media_type == "audio":
+            final_path = Path(task.file_path)
+            if final_path.suffix.lower() == ".m4a":
+                review_path = OUTPUT_DIR / f"{task.job_id}_review.mp3"
+                cleanup_paths([review_path])
+
+    # 无论解析结果如何，都返回 success，避免微信重复推送。
     return PlainTextResponse(content="success")
 
 
