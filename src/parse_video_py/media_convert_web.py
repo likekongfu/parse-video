@@ -16,6 +16,7 @@ from parse_video_py.content_security import (
     WxSecurityServiceError,
     check_image,
     check_audio,
+    extract_video_keyframes,
     get_task_store,
     verify_openid_token,
     handle_callback_url_verification,
@@ -249,10 +250,10 @@ def validate_safe_filename(filename: str) -> str:
             detail="Invalid filename",
         )
     suffix = Path(name).suffix.lower()
-    if suffix not in {".mp3", ".m4a", ".mp4", ".gif"}:
+    if suffix not in {".mp3", ".m4a", ".mp4", ".gif", ".jpg", ".jpeg", ".png"}:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only .mp3, .m4a, .mp4 and .gif files are allowed",
+            detail="Only media converter output files are allowed",
         )
     return name
 
@@ -1182,7 +1183,10 @@ async def add_text_watermark(
     font_color: str = Form(default="#FFFFFF"),
     opacity: float = Form(default=0.75),
     margin: int = Form(default=24),
+    openid_token: str = Form(default=""),
 ):
+    """给视频添加文字水印，并对最终视频的代表性关键帧进行内容安全审核。"""
+
     # ---- 1. 参数校验 ----
     display_name = safe_display_name(file.filename)
     validate_input_extension(display_name)
@@ -1193,7 +1197,36 @@ async def add_text_watermark(
     wm_opacity = validate_watermark_opacity(opacity)
     wm_margin = validate_watermark_margin(margin)
 
-    # ---- 2. 保存上传视频（分块写入） ----
+    # ---- 2. 内容安全开启时验证 openid_token ----
+    verified_openid = ""
+
+    if _SEC_ENABLED:
+        if not openid_token or not openid_token.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="内容安全已开启，openid_token 不能为空",
+            )
+
+        try:
+            verified_openid = verify_openid_token(openid_token)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"openid_token 无效: {exc}",
+            )
+        except WxSecurityError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"openid 验证服务异常: {exc.message}",
+            )
+
+        if not PUBLIC_BASE_URL:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="内容安全已开启但 PUBLIC_BASE_URL 未配置",
+            )
+
+    # ---- 3. 保存上传视频 ----
     ensure_dir(UPLOAD_DIR)
     server_filename = uuid.uuid4().hex
     input_suffix = Path(display_name).suffix.lower()
@@ -1213,56 +1246,238 @@ async def add_text_watermark(
         cleanup_paths([input_path])
         raise
 
-    # ---- 3. 写入水印文字到临时文件 ----
+    # ---- 4. 写入水印文字临时文件 ----
     try:
         textfile_path.write_text(wm_text, encoding="utf-8")
     except Exception:
-        cleanup_paths([input_path])
+        cleanup_paths([input_path, textfile_path])
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Watermark failed",
         )
 
-    # ---- 4. ffprobe 基础校验 ----
+    # ---- 5. ffprobe 基础校验 ----
     try:
         media_info = probe_video_basic(input_path)
     except HTTPException:
         cleanup_paths([input_path, textfile_path])
         raise
 
-    # ---- 5. FFmpeg 水印处理 ----
+    # ---- 6. 生成带水印 MP4 ----
     ensure_dir(OUTPUT_DIR)
     output_filename = server_filename + ".mp4"
     output_path = OUTPUT_DIR / output_filename
 
     try:
         run_watermark_ffmpeg(
-            input_path, output_path, textfile_path,
-            wm_font_size, wm_font_color, wm_opacity,
-            wm_position, wm_margin,
+            input_path,
+            output_path,
+            textfile_path,
+            wm_font_size,
+            wm_font_color,
+            wm_opacity,
+            wm_position,
+            wm_margin,
             media_info["has_audio"],
         )
     except HTTPException:
         cleanup_paths([input_path, textfile_path, output_path])
         raise
 
-    # ---- 6. 清理输入文件和临时文本文件 ----
+    # 原始视频和文字文件不再需要
     cleanup_paths([input_path, textfile_path])
 
-    # ---- 7. 清理过期输出 ----
+    output_display = Path(display_name).stem + "_watermark.mp4"
+    job_id = server_filename
+    trace_id = ""
+    is_pending = False
+
+    # 临时审核图片：从最终带水印视频抽取最多 3 个关键帧，
+    # 选择中间一张作为代表帧提交微信图片审核。
+    review_filename = server_filename + "_review.jpg"
+    review_path = OUTPUT_DIR / review_filename
+    review_frames_dir = UPLOAD_DIR / (server_filename + "_review_frames")
+
+    # ---- 7. 提交代表帧图片审核 ----
+    if _SEC_ENABLED and verified_openid:
+        try:
+            frames = extract_video_keyframes(
+                input_path=output_path,
+                output_dir=review_frames_dir,
+                ffmpeg_bin=FFMPEG_BIN,
+                max_frames=3,
+                timeout=60,
+            )
+
+            if not frames:
+                raise WxSecurityServiceError(
+                    "未能从水印视频中抽取审核关键帧"
+                )
+
+            selected_frame = frames[len(frames) // 2]
+            shutil.copyfile(selected_frame, review_path)
+            cleanup_paths([review_frames_dir])
+
+            if not review_path.exists() or review_path.stat().st_size <= 0:
+                raise WxSecurityServiceError(
+                    "水印视频审核图片生成失败"
+                )
+
+            review_url = f"{PUBLIC_BASE_URL}/files/{review_filename}"
+
+            result = check_image(
+                media_url=review_url,
+                openid=verified_openid,
+            )
+
+            trace_id = result.trace_id
+            if not trace_id:
+                raise WxSecurityServiceError(
+                    "微信图片内容安全接口未返回 trace_id"
+                )
+
+            task_store = get_task_store()
+            task_store.create_task(
+                job_id=job_id,
+                trace_id=trace_id,
+                # 审核拒绝时，现有回调会删除最终 MP4。
+                file_path=str(output_path),
+                openid=verified_openid,
+                media_url=review_url,
+                media_type="watermark_video",
+            )
+
+            is_pending = True
+
+        except (WxSecurityError, ValueError, OSError) as exc:
+            cleanup_paths([review_frames_dir, review_path])
+
+            log = __import__("logging").getLogger(__name__)
+            log.exception(
+                "[watermark-audit] 内容安全提交失败 "
+                "job_id=%s errcode=%s code=%s message=%s",
+                job_id,
+                getattr(exc, "errcode", None),
+                getattr(exc, "code", None),
+                getattr(exc, "message", str(exc)),
+            )
+
+            if _SEC_STRICT:
+                cleanup_paths([output_path])
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="内容安全服务异常，请稍后重试",
+                )
+
+            # 非严格模式沿用现有兼容行为：审核提交失败时直接返回结果。
+            is_pending = False
+
+        finally:
+            cleanup_paths([review_frames_dir])
+
+    # ---- 8. 清理过期输出 ----
     cleanup_expired_outputs()
 
-    # ---- 8. 构造响应 ----
+    # 审核提交成功：返回 pending，不返回 MP4 下载地址。
+    if is_pending:
+        return api_success({
+            "jobId": job_id,
+            "status": "pending",
+            "filename": output_display,
+            "traceId": trace_id,
+            "message": "水印视频已生成，内容安全审核中，请稍后查询",
+        })
+
+    # 内容安全关闭，或非严格模式下审核提交失败：保持原行为。
     download_url = ""
     if PUBLIC_BASE_URL:
         download_url = f"{PUBLIC_BASE_URL}/files/{output_filename}"
-
-    output_display = Path(display_name).stem + "_watermark.mp4"
 
     return api_success({
         "filename": output_display,
         "download_url": download_url,
         "expires_in": OUTPUT_TTL_SECONDS,
+    })
+
+
+@app.get(
+    "/media/video/add-text-watermark/status/{job_id}",
+    dependencies=[Depends(require_token)],
+)
+async def add_text_watermark_status(job_id: str):
+    """查询视频加水印任务的代表帧内容安全审核状态。"""
+
+    task_store = get_task_store()
+    task = task_store.get_task(job_id)
+
+    if task is None or task.media_type != "watermark_video":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="任务不存在或已过期",
+        )
+
+    final_path = Path(task.file_path)
+    file_name = final_path.name
+    review_path = OUTPUT_DIR / f"{job_id}_review.jpg"
+
+    if task.status == "approved":
+        cleanup_paths([review_path])
+
+        if not final_path.exists() or not final_path.is_file():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="File not found or expired",
+            )
+
+        download_url = ""
+        if PUBLIC_BASE_URL:
+            download_url = f"{PUBLIC_BASE_URL}/files/{file_name}"
+
+        return api_success({
+            "jobId": job_id,
+            "status": "approved",
+            "filename": file_name,
+            "downloadUrl": download_url,
+            "expiresIn": OUTPUT_TTL_SECONDS,
+            "traceId": task.trace_id,
+        })
+
+    if task.status == "rejected":
+        cleanup_paths([review_path])
+
+        return api_success({
+            "jobId": job_id,
+            "status": "rejected",
+            "filename": file_name,
+            "downloadUrl": "",
+            "message": "内容安全审核不通过，水印视频已删除",
+            "traceId": task.trace_id,
+            "result": task.result,
+        })
+
+    if task.status in {"error", "expired"}:
+        cleanup_paths([review_path])
+
+        message = "审核失败或任务已过期"
+        if task.result:
+            message = task.result.get("message", message)
+
+        return api_success({
+            "jobId": job_id,
+            "status": "error",
+            "filename": file_name,
+            "downloadUrl": "",
+            "message": message,
+            "traceId": task.trace_id,
+        })
+
+    return api_success({
+        "jobId": job_id,
+        "status": "pending",
+        "filename": file_name,
+        "downloadUrl": "",
+        "message": "内容安全审核中，请稍后查询",
+        "traceId": task.trace_id,
     })
 
 
@@ -1559,15 +1774,20 @@ async def wx_callback_event(request: Request):
         nonce=nonce,
     )
 
-    # M4A 使用临时 MP3 审核；收到结果后立即清理临时文件。
+    # 审核完成后清理各功能生成的临时审核文件。
     if result and result.trace_id:
         task_store = get_task_store()
         task = task_store.get_task_by_trace_id(result.trace_id)
+
         if task and task.media_type == "audio":
             final_path = Path(task.file_path)
             if final_path.suffix.lower() == ".m4a":
                 review_path = OUTPUT_DIR / f"{task.job_id}_review.mp3"
                 cleanup_paths([review_path])
+
+        if task and task.media_type == "watermark_video":
+            review_path = OUTPUT_DIR / f"{task.job_id}_review.jpg"
+            cleanup_paths([review_path])
 
     # 无论解析结果如何，都返回 success，避免微信重复推送。
     return PlainTextResponse(content="success")
@@ -1603,6 +1823,10 @@ async def download_file(filename: str):
         media_type = "video/mp4"
     elif suffix == ".gif":
         media_type = "image/gif"
+    elif suffix in {".jpg", ".jpeg"}:
+        media_type = "image/jpeg"
+    elif suffix == ".png":
+        media_type = "image/png"
     else:
         media_type = "audio/mp4"
 
