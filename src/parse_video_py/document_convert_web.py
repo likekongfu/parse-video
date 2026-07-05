@@ -11,6 +11,17 @@ from fastapi.responses import FileResponse
 from pdf2docx import Converter
 from starlette.background import BackgroundTask
 
+# 内容安全审核
+from parse_video_py.content_security import (
+    WxSecurityError,
+    WxSecurityRejectedError,
+    WxSecurityServiceError,
+    extract_pdf_text,
+    check_text,
+    verify_openid_token,
+)
+from parse_video_py.content_security import WX_CONTENT_SECURITY_ENABLED as _SEC_ENABLED
+
 
 ALLOWED_EXTENSIONS = {".doc", ".docx", ".rtf", ".odt"}
 PDF_EXTENSIONS = {".pdf"}
@@ -495,6 +506,8 @@ async def pdf_to_word(file: UploadFile = File(...)):
 async def pdf_to_images(
     file: UploadFile = File(...),
     pages: str = Form(default=""),
+    openid: str = Form(default=""),
+    openid_token: str = Form(default=""),
 ):
     filename = safe_filename(file.filename)
     validate_pdf_extension(filename)
@@ -509,6 +522,53 @@ async def pdf_to_images(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Uploaded file is empty",
             )
+
+        # ---- 内容安全：提取 PDF 文本并审核（同步） ----
+        if _SEC_ENABLED:
+            # 优先使用 openid_token（签名验证），fallback 到原始 openid（向后兼容）
+            verified_openid = ""
+            if openid_token and openid_token.strip():
+                try:
+                    verified_openid = verify_openid_token(openid_token)
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"openid_token 无效: {exc}",
+                    )
+                except WxSecurityError as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail=f"openid 验证服务异常: {exc.message}",
+                    )
+            elif openid and openid.strip():
+                # 向后兼容：允许旧版直接传 openid（不推荐）
+                verified_openid = openid.strip()
+            else:
+                # 安全审核已开启但未提供 openid → 拒绝
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="内容安全已开启，需提供有效的 openid_token",
+                )
+
+            try:
+                pdf_text = extract_pdf_text(input_path, max_chars=2500)
+                if pdf_text:
+                    check_text(pdf_text, openid=verified_openid)
+            except WxSecurityRejectedError:
+                # 严格模式：内容违规 → 清理输入并拒绝
+                cleanup_paths([work_dir])
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="内容安全审核不通过，请修改后重试",
+                )
+            except WxSecurityServiceError:
+                # 审核服务异常 → 清理输入并拒绝（安全优先）
+                cleanup_paths([work_dir])
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="内容安全服务异常，请稍后重试",
+                )
+
         ensure_dir(OUTPUT_DIR)
         images = render_pdf_pages(input_path, pages, OUTPUT_DIR)
         cleanup_expired_outputs()
@@ -521,6 +581,8 @@ async def pdf_to_images(
                 "images": images,
             },
         )
+    except HTTPException:
+        raise
     finally:
         cleanup_paths([work_dir])
 

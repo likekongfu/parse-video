@@ -2,14 +2,29 @@ import json
 import os
 import shutil
 import subprocess
-import tempfile
 import time
 import uuid
 from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile, status
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+
+# 内容安全审核
+from parse_video_py.content_security import (
+    WxSecurityError,
+    WxSecurityServiceError,
+    check_image,
+    get_task_store,
+    verify_openid_token,
+    handle_callback_url_verification,
+    handle_callback_event,
+)
+from parse_video_py.content_security import WX_CONTENT_SECURITY_ENABLED as _SEC_ENABLED
+from parse_video_py.content_security import WX_CONTENT_SECURITY_STRICT as _SEC_STRICT
+
+# 微信小程序登录
+from parse_video_py.auth_web import router as auth_router
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +106,9 @@ app = FastAPI(
     redoc_url=None if DISABLE_DOCS else "/redoc",
     openapi_url=None if DISABLE_DOCS else "/openapi.json",
 )
+
+# 挂载微信小程序登录路由（公网地址: /parse/media-converter/auth/wechat-login）
+app.include_router(auth_router)
 
 
 # ---------------------------------------------------------------------------
@@ -891,6 +909,15 @@ async def startup_event() -> None:
     ensure_dir(UPLOAD_DIR)
     ensure_dir(OUTPUT_DIR)
     cleanup_expired_outputs()
+    # 恢复并清理过期审核任务
+    try:
+        task_store = get_task_store()
+        cleaned = task_store.cleanup_expired()
+        if cleaned > 0:
+            log = __import__("logging").getLogger(__name__)
+            log.info("启动时清理 %s 个过期审核任务", cleaned)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1069,6 +1096,7 @@ async def video_to_gif(
     duration: float = Form(...),
     width: int = Form(...),
     fps: int = Form(...),
+    openid_token: str = Form(default=""),
 ):
     # ---- 1. 参数校验 ----
     display_name = safe_display_name(file.filename)
@@ -1095,7 +1123,35 @@ async def video_to_gif(
             detail="Invalid GIF fps",
         )
 
-    # ---- 2. 保存上传文件（分块写入） ----
+    # ---- 2. 验证 openid ----
+    verified_openid = ""
+    if _SEC_ENABLED:
+        if not openid_token or not openid_token.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="内容安全已开启，openid_token 不能为空",
+            )
+        try:
+            verified_openid = verify_openid_token(openid_token)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"openid_token 无效: {exc}",
+            )
+        except WxSecurityError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"openid 验证服务异常: {exc.message}",
+            )
+
+        # 提交异步审核需要公网 URL
+        if not PUBLIC_BASE_URL:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="内容安全已开启但 PUBLIC_BASE_URL 未配置，无法提交异步审核",
+            )
+
+    # ---- 3. 保存上传文件（分块写入） ----
     ensure_dir(UPLOAD_DIR)
     server_filename = uuid.uuid4().hex
     input_suffix = Path(display_name).suffix.lower()
@@ -1112,14 +1168,14 @@ async def video_to_gif(
         cleanup_paths([input_path])
         raise
 
-    # ---- 3. ffprobe 校验视频和截取范围 ----
+    # ---- 4. ffprobe 校验视频和截取范围 ----
     try:
         media_info = probe_video_for_gif(input_path, start_time, duration)
     except HTTPException:
         cleanup_paths([input_path])
         raise
 
-    # ---- 4. FFmpeg 生成 GIF ----
+    # ---- 5. FFmpeg 生成 GIF ----
     ensure_dir(OUTPUT_DIR)
     output_filename = server_filename + ".gif"
     output_path = OUTPUT_DIR / output_filename
@@ -1130,24 +1186,205 @@ async def video_to_gif(
         cleanup_paths([input_path, output_path])
         raise
 
-    # ---- 5. 清理输入视频 ----
+    # ---- 6. 清理输入视频 ----
     cleanup_paths([input_path])
 
-    # ---- 6. 清理过期输出 ----
+    # ---- 7. 内容安全：提交异步图片审核（不立即公开 downloadUrl） ----
+    job_id = server_filename  # 复用 UUID 作为 job_id
+    trace_id = ""
+    is_pending = False
+
+    if _SEC_ENABLED and verified_openid:
+        gif_url = f"{PUBLIC_BASE_URL}/files/{output_filename}"
+        try:
+            result = check_image(gif_url, openid=verified_openid)
+            trace_id = result.trace_id
+            is_pending = True
+
+            # 创建持久化审核任务
+            task_store = get_task_store()
+            task_store.create_task(
+                job_id=job_id,
+                trace_id=trace_id,
+                file_path=str(output_path),
+                openid=verified_openid,
+                media_url=gif_url,
+                media_type="image",
+            )
+        except WxSecurityServiceError:
+            if _SEC_STRICT:
+                # 严格模式：审核提交失败 → 删除输出文件并拒绝
+                cleanup_paths([output_path])
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="内容安全服务异常，请稍后重试",
+                )
+            # 非严格模式：审核提交失败不阻断，记录日志
+            is_pending = False
+
+    # ---- 8. 清理过期输出 ----
     cleanup_expired_outputs()
 
-    # ---- 7. 构造响应 ----
-    download_url = ""
-    if PUBLIC_BASE_URL:
-        download_url = f"{PUBLIC_BASE_URL}/files/{output_filename}"
-
+    # ---- 9. 构造响应 ----
     output_display = Path(display_name).stem + ".gif"
 
-    return api_success({
-        "filename": output_display,
-        "download_url": download_url,
-        "expires_in": OUTPUT_TTL_SECONDS,
-    })
+    if is_pending:
+        # 异步审核中：不返回 downloadUrl
+        return api_success({
+            "jobId": job_id,
+            "status": "pending",
+            "filename": output_display,
+            "traceId": trace_id,
+            "message": "GIF 已生成，内容安全审核中，请通过状态接口查询结果",
+        })
+    else:
+        # 未开启安全审核：直接返回 downloadUrl（保持向后兼容）
+        download_url = ""
+        if PUBLIC_BASE_URL:
+            download_url = f"{PUBLIC_BASE_URL}/files/{output_filename}"
+        return api_success({
+            "filename": output_display,
+            "download_url": download_url,
+            "expires_in": OUTPUT_TTL_SECONDS,
+        })
+
+
+@app.get(
+    "/media/video/to-gif/status/{job_id}",
+    dependencies=[Depends(require_token)],
+)
+async def gif_status(job_id: str):
+    """查询 GIF 转换任务的安全审核状态。
+
+    审核通过后才返回 downloadUrl。
+    """
+    task_store = get_task_store()
+    task = task_store.get_task(job_id)
+
+    if task is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="任务不存在或已过期",
+        )
+
+    # 提取文件名
+    file_name = Path(task.file_path).name
+
+    if task.status == "approved":
+        download_url = ""
+        if PUBLIC_BASE_URL:
+            download_url = f"{PUBLIC_BASE_URL}/files/{file_name}"
+        return api_success({
+            "jobId": job_id,
+            "status": "approved",
+            "filename": file_name,
+            "downloadUrl": download_url,
+            "expiresIn": OUTPUT_TTL_SECONDS,
+            "traceId": task.trace_id,
+        })
+    elif task.status == "rejected":
+        return api_success({
+            "jobId": job_id,
+            "status": "rejected",
+            "filename": file_name,
+            "downloadUrl": "",
+            "message": "内容安全审核不通过，输出文件已删除",
+            "traceId": task.trace_id,
+            "result": task.result,
+        })
+    elif task.status == "error":
+        return api_success({
+            "jobId": job_id,
+            "status": "error",
+            "filename": file_name,
+            "downloadUrl": "",
+            "message": (
+                task.result.get("message", "审核超时")
+                if task.result
+                else "审核超时"
+            ),
+            "traceId": task.trace_id,
+        })
+    else:
+        # pending
+        return api_success({
+            "jobId": job_id,
+            "status": "pending",
+            "filename": file_name,
+            "downloadUrl": "",
+            "message": "内容安全审核中，请稍后查询",
+            "traceId": task.trace_id,
+        })
+
+
+# ---------------------------------------------------------------------------
+# 微信内容安全回调端点
+# ---------------------------------------------------------------------------
+
+@app.get("/content-security/callback", include_in_schema=False)
+async def wx_callback_verify(
+    signature: str = "",
+    timestamp: str = "",
+    nonce: str = "",
+    echostr: str = "",
+):
+    """微信公众平台 URL 验证（GET）。
+
+    微信在配置消息推送地址时会发送 GET 请求验证 URL 归属。
+    需要验证签名并返回解密后的 echostr。
+    """
+    if not signature or not timestamp or not nonce or not echostr:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="缺少必要参数: signature/timestamp/nonce/echostr",
+        )
+
+    ok, plaintext = handle_callback_url_verification(
+        signature=signature,
+        timestamp=timestamp,
+        nonce=nonce,
+        echostr=echostr,
+    )
+
+    if not ok or plaintext is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="签名验证失败",
+        )
+
+    # 返回纯文本 echostr（不包装 JSON）
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(content=plaintext)
+
+
+@app.post("/content-security/callback", include_in_schema=False)
+async def wx_callback_event(request: Request):
+    """微信审核结果异步推送（POST）。
+
+    微信在审核完成后主动推送 wxa_media_check 事件到此端点。
+    """
+    body = await request.body()
+    if not body:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="请求体为空",
+        )
+
+    # 从 URL 参数获取签名信息
+    params = request.query_params
+    msg_signature = params.get("msg_signature", "")
+    timestamp = params.get("timestamp", "")
+    nonce = params.get("nonce", "")
+
+    result = handle_callback_event(
+        body=body,
+        msg_signature=msg_signature,
+        timestamp=timestamp,
+        nonce=nonce,
+    )
+
+    # 无论解析结果如何，都返回 "success" 以告知微信服务器停止重试
+    return PlainTextResponse(content="success")
 
 
 @app.get("/files/{filename}", dependencies=[Depends(require_token)])
