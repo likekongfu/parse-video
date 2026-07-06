@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from parse_video_py.content_security import (
     WxSecurityError,
     WxSecurityServiceError,
+    check_text,
     check_image,
     check_audio,
     extract_video_keyframes,
@@ -1226,6 +1227,57 @@ async def add_text_watermark(
                 detail="内容安全已开启但 PUBLIC_BASE_URL 未配置",
             )
 
+        # 水印文字使用同步文本内容安全审核。
+        # 在保存和处理视频前完成，违规文字可直接拒绝，避免浪费磁盘和转码资源。
+        try:
+            text_check_result = check_text(
+                content=wm_text,
+                openid=verified_openid,
+                scene=2,
+                title="视频水印文字",
+            )
+
+            # 非严格模式下 check_text 不会主动抛出违规异常，
+            # 因此仍需显式判断结果，确保 risky/review 不会继续生成视频。
+            if not text_check_result.is_pass:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="水印文字内容安全审核不通过，请修改后重试",
+                )
+
+        except HTTPException:
+            raise
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"水印文字审核参数无效: {exc}",
+            )
+        except WxSecurityError as exc:
+            # 严格模式下，内容违规会由 check_text 直接抛出 CONTENT_REJECTED。
+            if getattr(exc, "code", "") == "CONTENT_REJECTED":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="水印文字内容安全审核不通过，请修改后重试",
+                )
+
+            log = __import__("logging").getLogger(__name__)
+            log.exception(
+                "[watermark-text-audit] 文本审核服务异常 "
+                "errcode=%s code=%s message=%s",
+                getattr(exc, "errcode", None),
+                getattr(exc, "code", None),
+                getattr(exc, "message", str(exc)),
+            )
+
+            if _SEC_STRICT:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="水印文字内容安全服务异常，请稍后重试",
+                )
+
+            # 非严格模式下仅在审核服务不可用时兼容放行；
+            # 明确返回 risky/review 的文字仍会在上方被拒绝。
+
     # ---- 3. 保存上传视频 ----
     ensure_dir(UPLOAD_DIR)
     server_filename = uuid.uuid4().hex
@@ -1349,7 +1401,7 @@ async def add_text_watermark(
 
             is_pending = True
 
-        except (WxSecurityError, ValueError, OSError) as exc:
+        except Exception as exc:
             cleanup_paths([review_frames_dir, review_path])
 
             log = __import__("logging").getLogger(__name__)
