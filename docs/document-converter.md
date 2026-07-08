@@ -9,6 +9,8 @@ It is designed to run as a separate container from the existing video parsing AP
 - `POST /document/word-to-pdf`
 - `POST /document/convert-to-pdf`
 - `POST /document/pdf-to-word`
+- `POST /document/pdf-compress`
+- `POST /document/pdf-encrypt`
 
 All conversion endpoints accept multipart form-data:
 
@@ -22,6 +24,23 @@ curl -X POST http://127.0.0.1:8010/document/word-to-pdf \
 curl -X POST http://127.0.0.1:8010/document/pdf-to-word \
   -F "file=@sample.pdf" \
   --output sample.docx
+```
+
+```bash
+curl -X POST http://127.0.0.1:8010/document/pdf-compress \
+  -F "file=@sample.pdf" \
+  -F "level=heavy"
+```
+
+`level` supports `normal`, `heavy`, and `extreme`.
+
+```bash
+curl -X POST http://127.0.0.1:8010/document/pdf-encrypt \
+  -F "file=@sample.pdf" \
+  -F "password=change-me-123" \
+  -F "allow_print=true" \
+  -F "allow_copy=false" \
+  -F "allow_modify=false"
 ```
 
 If `DOCUMENT_CONVERTER_TOKEN` is set, add:
@@ -41,8 +60,12 @@ Word to PDF:
 PDF to Word:
 - `.pdf`
 
+PDF compress / encrypt:
+- `.pdf`
+
 Word to PDF uses LibreOffice headless mode, so it preserves layout much better than text-only conversion.
 PDF to Word uses `pdf2docx`, which works best for text-based PDFs. Scanned PDFs need a separate OCR flow.
+PDF compress uses PyMuPDF image rewriting and object cleanup. PDF encrypt uses AES-256 with pikepdf when available, with PyMuPDF as a fallback.
 
 ## Docker
 

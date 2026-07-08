@@ -27,6 +27,7 @@ web = [
 document = [
     "pdf2docx>=0.5.12",
     "PyMuPDF>=1.24",
+    "pikepdf>=9.0",
 ]
 cli = [
     "typer>=0.12",

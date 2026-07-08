@@ -21,6 +21,9 @@ source_commit: dd55df3
 | `PARSE_VIDEO_USERNAME` | Basic Auth 用户名 | 是 | 不设置=不开启 | `web.py:34` | `web.py:34` |
 | `PARSE_VIDEO_PASSWORD` | Basic Auth 密码 | 是 | 不设置=不开启 | `web.py:35` | `web.py:35` |
 | `PARSE_VIDEO_PROXY` | HTTP/HTTPS 代理地址 | 是 | 不设置=直连 | `utils.py:create_async_client()` | `utils.py` |
+| `DOCUMENT_CONVERTER_MAX_UPLOAD_BYTES` | 文档转换服务最大上传体积 | 否 | `20971520` | `document_convert_web.py` | `document_convert_web.py` |
+| `DOCUMENT_CONVERTER_PDF_PASSWORD_MIN_LENGTH` | PDF 加密密码最小长度 | 否 | `6` | `document_convert_web.py` | `document_convert_web.py` |
+| `DOCUMENT_CONVERTER_PDF_PASSWORD_MAX_LENGTH` | PDF 加密密码最大长度 | 否 | `32` | `document_convert_web.py` | `document_convert_web.py` |
 
 ## 安装依赖
 

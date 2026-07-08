@@ -6,7 +6,16 @@ import uuid
 from pathlib import Path
 from typing import Iterable
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, status
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    UploadFile,
+    status,
+)
 from fastapi.responses import FileResponse
 from pdf2docx import Converter
 from starlette.background import BackgroundTask
@@ -22,15 +31,20 @@ from parse_video_py.content_security import (
 )
 from parse_video_py.content_security import WX_CONTENT_SECURITY_ENABLED as _SEC_ENABLED
 
-
 ALLOWED_EXTENSIONS = {".doc", ".docx", ".rtf", ".odt"}
 PDF_EXTENSIONS = {".pdf"}
-MAX_UPLOAD_BYTES = int(os.getenv("DOCUMENT_CONVERTER_MAX_UPLOAD_BYTES", "15728640"))
+MAX_UPLOAD_BYTES = int(os.getenv("DOCUMENT_CONVERTER_MAX_UPLOAD_BYTES", "20971520"))
 CONVERT_TIMEOUT_SECONDS = int(os.getenv("DOCUMENT_CONVERTER_TIMEOUT_SECONDS", "90"))
 PDF_IMAGE_ZOOM = float(os.getenv("DOCUMENT_CONVERTER_PDF_IMAGE_ZOOM", "1.6"))
 PDF_IMAGE_MAX_PAGES = int(os.getenv("DOCUMENT_CONVERTER_PDF_IMAGE_MAX_PAGES", "20"))
 PDF_IMAGE_MAX_RESPONSE_BYTES = int(
     os.getenv("DOCUMENT_CONVERTER_PDF_IMAGE_MAX_RESPONSE_BYTES", "12582912")
+)
+PDF_PASSWORD_MIN_LENGTH = int(
+    os.getenv("DOCUMENT_CONVERTER_PDF_PASSWORD_MIN_LENGTH", "6")
+)
+PDF_PASSWORD_MAX_LENGTH = int(
+    os.getenv("DOCUMENT_CONVERTER_PDF_PASSWORD_MAX_LENGTH", "32")
 )
 LIBREOFFICE_BIN = os.getenv("LIBREOFFICE_BIN", "libreoffice")
 API_TOKEN = os.getenv("DOCUMENT_CONVERTER_TOKEN", "").strip()
@@ -43,9 +57,35 @@ DISABLE_DOCS = os.getenv("DISABLE_DOCS", "").strip().lower() in {
 
 # 输出 / 下载配置
 OUTPUT_DIR = Path(os.getenv("DOCUMENT_CONVERTER_OUTPUT_DIR", "data/document-output"))
-PUBLIC_BASE_URL = os.getenv("DOCUMENT_CONVERTER_PUBLIC_BASE_URL", "").strip().rstrip("/")
+PUBLIC_BASE_URL = (
+    os.getenv("DOCUMENT_CONVERTER_PUBLIC_BASE_URL", "").strip().rstrip("/")
+)
 OUTPUT_TTL_SECONDS = int(os.getenv("DOCUMENT_CONVERTER_OUTPUT_TTL_SECONDS", "7200"))
 ALLOWED_DOWNLOAD_EXTENSIONS: set[str] = {".png", ".jpg", ".jpeg", ".pdf", ".docx"}
+
+PDF_COMPRESS_LEVELS = {
+    "normal": {
+        "dpi_threshold": 180,
+        "dpi_target": 150,
+        "quality": 82,
+        "garbage": 3,
+        "compression_effort": 6,
+    },
+    "heavy": {
+        "dpi_threshold": 150,
+        "dpi_target": 110,
+        "quality": 68,
+        "garbage": 4,
+        "compression_effort": 8,
+    },
+    "extreme": {
+        "dpi_threshold": 120,
+        "dpi_target": 96,
+        "quality": 55,
+        "garbage": 4,
+        "compression_effort": 9,
+    },
+}
 
 app = FastAPI(
     title="Document Converter Service",
@@ -98,6 +138,37 @@ def validate_pdf_extension(filename: str) -> str:
             detail="Unsupported file type. Allowed: .pdf",
         )
     return suffix
+
+
+def validate_pdf_password(password: str) -> str:
+    value = (password or "").strip()
+    if not value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password is required",
+        )
+    if len(value) < PDF_PASSWORD_MIN_LENGTH:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Password must be at least {PDF_PASSWORD_MIN_LENGTH} characters",
+        )
+    if len(value) > PDF_PASSWORD_MAX_LENGTH:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Password must be at most {PDF_PASSWORD_MAX_LENGTH} characters",
+        )
+    return value
+
+
+def validate_compress_level(level: str | None) -> str:
+    value = (level or "normal").strip().lower()
+    if value not in PDF_COMPRESS_LEVELS:
+        allowed = ", ".join(sorted(PDF_COMPRESS_LEVELS))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported compression level. Allowed: {allowed}",
+        )
+    return value
 
 
 def parse_page_range(text: str | None, total_pages: int) -> list[int]:
@@ -186,7 +257,9 @@ def run_libreoffice(input_path: Path, output_dir: Path) -> Path:
 
     pdf_path = output_dir / (input_path.stem + ".pdf")
     if result.returncode != 0 or not pdf_path.exists():
-        message = (result.stderr or result.stdout or "LibreOffice conversion failed").strip()
+        message = (
+            result.stderr or result.stdout or "LibreOffice conversion failed"
+        ).strip()
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=message[-800:],
@@ -210,6 +283,243 @@ def run_pdf2docx(input_path: Path, output_path: Path) -> Path:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="PDF to Word conversion failed",
+        )
+    return output_path
+
+
+def build_pdf_permissions(
+    allow_print: bool,
+    allow_copy: bool,
+    allow_modify: bool,
+) -> int:
+    try:
+        import fitz
+    except ImportError as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="PyMuPDF is not installed",
+        ) from error
+
+    permissions = fitz.PDF_PERM_ACCESSIBILITY
+    if allow_print:
+        permissions |= fitz.PDF_PERM_PRINT | fitz.PDF_PERM_PRINT_HQ
+    if allow_copy:
+        permissions |= fitz.PDF_PERM_COPY
+    if allow_modify:
+        permissions |= (
+            fitz.PDF_PERM_MODIFY
+            | fitz.PDF_PERM_ANNOTATE
+            | fitz.PDF_PERM_FORM
+            | fitz.PDF_PERM_ASSEMBLE
+        )
+    return permissions
+
+
+def build_pikepdf_permissions(
+    allow_print: bool,
+    allow_copy: bool,
+    allow_modify: bool,
+):
+    try:
+        import pikepdf
+    except ImportError as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="pikepdf is not installed",
+        ) from error
+
+    return pikepdf.Permissions(
+        accessibility=True,
+        extract=allow_copy,
+        modify_annotation=allow_modify,
+        modify_assembly=allow_modify,
+        modify_form=allow_modify,
+        modify_other=allow_modify,
+        print_lowres=allow_print,
+        print_highres=allow_print,
+    )
+
+
+def run_pdf_encrypt(
+    input_path: Path,
+    output_path: Path,
+    password: str,
+    allow_print: bool = True,
+    allow_copy: bool = False,
+    allow_modify: bool = False,
+) -> Path:
+    try:
+        import pikepdf
+    except ImportError:
+        return run_pdf_encrypt_with_pymupdf(
+            input_path,
+            output_path,
+            password,
+            allow_print=allow_print,
+            allow_copy=allow_copy,
+            allow_modify=allow_modify,
+        )
+
+    try:
+        with pikepdf.open(str(input_path)) as pdf:
+            pdf.save(
+                str(output_path),
+                encryption=pikepdf.Encryption(
+                    owner=uuid.uuid4().hex + uuid.uuid4().hex,
+                    user=password,
+                    R=6,
+                    allow=build_pikepdf_permissions(
+                        allow_print=allow_print,
+                        allow_copy=allow_copy,
+                        allow_modify=allow_modify,
+                    ),
+                ),
+            )
+    except pikepdf.PasswordError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Encrypted PDF is not supported",
+        ) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(error)[-800:] or "PDF encryption failed",
+        ) from error
+
+    if not output_path.exists() or output_path.stat().st_size <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="PDF encryption failed",
+        )
+    return output_path
+
+
+def run_pdf_encrypt_with_pymupdf(
+    input_path: Path,
+    output_path: Path,
+    password: str,
+    allow_print: bool = True,
+    allow_copy: bool = False,
+    allow_modify: bool = False,
+) -> Path:
+    try:
+        import fitz
+    except ImportError as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="PyMuPDF is not installed",
+        ) from error
+
+    try:
+        document = fitz.open(str(input_path))
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(error)[-800:] or "Failed to open PDF",
+        ) from error
+
+    try:
+        if document.needs_pass:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Encrypted PDF is not supported",
+            )
+        document.save(
+            str(output_path),
+            garbage=4,
+            clean=True,
+            deflate=True,
+            deflate_images=True,
+            deflate_fonts=True,
+            use_objstms=1,
+            encryption=fitz.PDF_ENCRYPT_AES_256,
+            owner_pw=uuid.uuid4().hex,
+            user_pw=password,
+            permissions=build_pdf_permissions(
+                allow_print=allow_print,
+                allow_copy=allow_copy,
+                allow_modify=allow_modify,
+            ),
+        )
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(error)[-800:] or "PDF encryption failed",
+        ) from error
+    finally:
+        document.close()
+
+    if not output_path.exists() or output_path.stat().st_size <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="PDF encryption failed",
+        )
+    return output_path
+
+
+def run_pdf_compress(input_path: Path, output_path: Path, level: str) -> Path:
+    try:
+        import fitz
+    except ImportError as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="PyMuPDF is not installed",
+        ) from error
+
+    options = PDF_COMPRESS_LEVELS[level]
+    try:
+        document = fitz.open(str(input_path))
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(error)[-800:] or "Failed to open PDF",
+        ) from error
+
+    try:
+        if document.needs_pass:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Encrypted PDF is not supported",
+            )
+
+        if hasattr(document, "rewrite_images"):
+            document.rewrite_images(
+                dpi_threshold=options["dpi_threshold"],
+                dpi_target=options["dpi_target"],
+                quality=options["quality"],
+                lossy=True,
+                lossless=True,
+                bitonal=True,
+                color=True,
+                gray=True,
+            )
+
+        document.save(
+            str(output_path),
+            garbage=options["garbage"],
+            clean=True,
+            deflate=True,
+            deflate_images=True,
+            deflate_fonts=True,
+            use_objstms=1,
+            compression_effort=options["compression_effort"],
+        )
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(error)[-800:] or "PDF compression failed",
+        ) from error
+    finally:
+        document.close()
+
+    if not output_path.exists() or output_path.stat().st_size <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="PDF compression failed",
         )
     return output_path
 
@@ -376,7 +686,9 @@ async def download_file(filename: str):
     elif suffix == ".pdf":
         media_type = "application/pdf"
     elif suffix == ".docx":
-        media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        media_type = (
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
     else:
         media_type = "image/png"
 
@@ -582,6 +894,132 @@ async def pdf_to_images(
             },
         )
     except HTTPException:
+        raise
+    finally:
+        cleanup_paths([work_dir])
+
+
+@app.post("/document/pdf-compress", dependencies=[Depends(require_token)])
+async def pdf_compress(
+    file: UploadFile = File(...),
+    level: str = Form(default="normal"),
+):
+    filename = safe_filename(file.filename)
+    validate_pdf_extension(filename)
+    compress_level = validate_compress_level(level)
+
+    work_dir = Path(tempfile.mkdtemp(prefix="pdf-compress-"))
+    input_path = work_dir / (uuid.uuid4().hex + ".pdf")
+    server_name = uuid.uuid4().hex + ".pdf"
+    ensure_dir(OUTPUT_DIR)
+    output_path = OUTPUT_DIR / server_name
+
+    try:
+        original_size = await save_upload(file, input_path)
+        if original_size <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Uploaded file is empty",
+            )
+
+        compressed_path = run_pdf_compress(input_path, output_path, compress_level)
+        compressed_size = compressed_path.stat().st_size
+        output_name = (
+            Path(filename).with_suffix("").name + f"_compressed_{compress_level}.pdf"
+        )
+        saved_percent = 0.0
+        if original_size > 0:
+            saved_percent = round((1 - compressed_size / original_size) * 100, 1)
+
+        download_url = ""
+        if PUBLIC_BASE_URL:
+            download_url = f"{PUBLIC_BASE_URL}/files/{server_name}"
+
+        cleanup_expired_outputs()
+        return api_response(
+            0,
+            "ok",
+            {
+                "fileName": output_name,
+                "size": compressed_size,
+                "originalSize": original_size,
+                "compressedSize": compressed_size,
+                "savedPercent": saved_percent,
+                "level": compress_level,
+                "downloadUrl": download_url,
+                "expiresIn": OUTPUT_TTL_SECONDS,
+            },
+        )
+    except Exception:
+        try:
+            output_path.unlink()
+        except OSError:
+            pass
+        raise
+    finally:
+        cleanup_paths([work_dir])
+
+
+@app.post("/document/pdf-encrypt", dependencies=[Depends(require_token)])
+async def pdf_encrypt(
+    file: UploadFile = File(...),
+    password: str = Form(...),
+    allow_print: bool = Form(default=True),
+    allow_copy: bool = Form(default=False),
+    allow_modify: bool = Form(default=False),
+):
+    filename = safe_filename(file.filename)
+    validate_pdf_extension(filename)
+    validated_password = validate_pdf_password(password)
+
+    work_dir = Path(tempfile.mkdtemp(prefix="pdf-encrypt-"))
+    input_path = work_dir / (uuid.uuid4().hex + ".pdf")
+    server_name = uuid.uuid4().hex + ".pdf"
+    ensure_dir(OUTPUT_DIR)
+    output_path = OUTPUT_DIR / server_name
+
+    try:
+        size = await save_upload(file, input_path)
+        if size <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Uploaded file is empty",
+            )
+
+        encrypted_path = run_pdf_encrypt(
+            input_path,
+            output_path,
+            validated_password,
+            allow_print=allow_print,
+            allow_copy=allow_copy,
+            allow_modify=allow_modify,
+        )
+        file_size = encrypted_path.stat().st_size
+        output_name = Path(filename).with_suffix("").name + "_encrypted.pdf"
+
+        download_url = ""
+        if PUBLIC_BASE_URL:
+            download_url = f"{PUBLIC_BASE_URL}/files/{server_name}"
+
+        cleanup_expired_outputs()
+        return api_response(
+            0,
+            "ok",
+            {
+                "fileName": output_name,
+                "size": file_size,
+                "allowPrint": allow_print,
+                "allowCopy": allow_copy,
+                "allowModify": allow_modify,
+                "downloadUrl": download_url,
+                "expiresIn": OUTPUT_TTL_SECONDS,
+            },
+        )
+    except Exception:
+        try:
+            output_path.unlink()
+        except OSError:
+            pass
         raise
     finally:
         cleanup_paths([work_dir])
