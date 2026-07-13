@@ -19,8 +19,10 @@ from sqlalchemy import (
     UniqueConstraint, create_engine, insert, select,
 )
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects.mysql import VARBINARY
 
 _metadata = MetaData()
+_hash_binary_type = LargeBinary(32).with_variant(VARBINARY(32), "mysql")
 
 users = Table(
     "users", _metadata,
@@ -49,8 +51,8 @@ user_identities = Table(
 qr_login_sessions = Table(
     "qr_login_sessions", _metadata,
     Column("id", String(36), primary_key=True),
-    Column("scene_token_hash", LargeBinary(32), nullable=False, unique=True),
-    Column("login_ticket_hash", LargeBinary(32), nullable=True, unique=True),
+    Column("scene_token_hash", _hash_binary_type, nullable=False, unique=True),
+    Column("login_ticket_hash", _hash_binary_type, nullable=True, unique=True),
     Column("user_id", String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True),
     Column("status", String(20), nullable=False),
     Column("expires_at", BigInteger, nullable=False),

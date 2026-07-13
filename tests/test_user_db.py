@@ -3,8 +3,16 @@ import re
 
 import pytest
 from sqlalchemy import create_engine, func, select
+from sqlalchemy.dialects import mysql
+from sqlalchemy.schema import CreateTable
 
 import parse_video_py.user_db as user_db
+
+
+def test_qr_hash_columns_use_indexable_mysql_type():
+    ddl = str(CreateTable(user_db.qr_login_sessions).compile(dialect=mysql.dialect()))
+    assert "scene_token_hash VARBINARY(32)" in ddl
+    assert "login_ticket_hash VARBINARY(32)" in ddl
 
 
 @pytest.fixture()
