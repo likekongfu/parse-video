@@ -81,3 +81,7 @@ def test_qr_routes_keep_expected_contract():
         response = client.get("/auth/me", cookies={"web_session": "signed-session"})
         assert response.status_code == 200
         assert response.json()["user"]["internal_code"] == "ABC123"
+
+    response = client.post("/auth/logout", cookies={"web_session": "signed-session"})
+    assert response.status_code == 204
+    assert "Max-Age=0" in response.headers["set-cookie"]

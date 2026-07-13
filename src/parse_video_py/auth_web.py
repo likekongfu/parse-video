@@ -418,8 +418,11 @@ def current_user(request: Request):
 
 @router.post("/logout", status_code=204)
 def logout(response: Response):
-    response.delete_cookie("web_session", path="/")
-    return response
+    response.delete_cookie(
+        "web_session", path="/", httponly=True,
+        secure=os.getenv("WEB_COOKIE_SECURE", "false").lower() == "true",
+        samesite="lax",
+    )
 
 
 # ---------------------------------------------------------------------------
