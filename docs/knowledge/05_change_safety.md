@@ -71,3 +71,12 @@ source_commit: dd55df3
 - 局部 bugfix 且不改变流程。
 - 测试用例补充但不改变规则。
 - 注释修正。
+
+## 统一用户变更安全
+
+- `user_db.py` 与 `auth_web.py` 属于高风险鉴权链路。
+- 必须保持现有 openidToken 签发和 `/auth/wechat-login` 响应兼容。
+- 修改身份映射时必须验证同一 OpenID 并发幂等和 internal_code 唯一性。
+- 不得将用户库变更耦合到内容安全审核接口。
+- 二维码 scene 和 login_ticket 必须使用强随机值并仅存哈希；ticket 必须原子单次兑换。
+- 小程序确认必须验证既有 openidToken，不能信任客户端提交的 user_id 或 openid。

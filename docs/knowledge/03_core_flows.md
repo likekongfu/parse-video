@@ -80,6 +80,28 @@ confidence: high
 
 ---
 
+## 流程：微信小程序统一用户登录
+
+1. 小程序继续调用 `POST /auth/wechat-login`，请求体为 `{"code": "..."}`。
+2. `auth_web.py:_call_code2session()` 获取 OpenID 和可选 UnionID。
+3. `user_db.py:get_or_create_user()` 按 `(wechat_miniprogram, openid)` 幂等创建或查询系统用户。
+4. 新用户生成一次永久稳定的 6 位大写字母数字 `internal_code`。
+5. 继续使用原有 `create_openid_token(openid)` 签发 `openidToken`。
+6. 响应字段保持 `code/msg/data.openidToken/data.expiresIn` 不变。
+
+并发安全依赖数据库唯一约束；身份或 internal_code 冲突时事务回滚并重新查询。
+
+### 网页小程序码登录
+
+1. 网页调用 `POST /auth/qr/create` 获取三分钟有效的小程序码与 scene_token。
+2. 网页每两秒调用 `GET /auth/qr/status/{scene_token}`。
+3. 小程序确认页复用 openidToken，通过 `Authorization: Bearer` 调用 `POST /auth/qr/confirm`。
+4. confirmed 状态签发一次性 login_ticket。
+5. 网页调用 `POST /auth/qr/exchange`，成功后设置 HttpOnly `web_session` Cookie。
+6. `GET /auth/me` 恢复用户，`POST /auth/logout` 清除 Cookie。
+
+---
+
 ## 流程：视频 ID 解析
 
 ### 是否已确认

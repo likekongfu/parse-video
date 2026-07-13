@@ -78,10 +78,12 @@ confidence: high
 
 ## 数据存储
 
-当前项目未发现数据库相关代码。解析结果为无状态的即时返回，不持久化存储。
+项目使用 SQLAlchemy Core，并复用同一组 MySQL 环境变量；未配置 MySQL 时回退至 `MATERIAL_DB_PATH` 指定的 SQLite。
 
-- 已检查路径：`src/`、`tests/`、`requirements.txt`、`pyproject.toml`
-- 证据：无 migration、无 ORM、无数据库连接配置
+- `web.py`：素材记录缓存。
+- `user_db.py`：`users`、`user_identities`、`qr_login_sessions`。
+- `qr_auth.py`：小程序码生成、状态、一次性 ticket 和网页 Cookie 会话。
+- `migrations/20260713_unified_users.sql`：MySQL 建表迁移。
 
 ## API 路由
 

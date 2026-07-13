@@ -1524,6 +1524,8 @@ class TestAuthWeb:
 
         self.client = TestClient(aw.app)
         self.aw = aw
+        self._user_db_patcher = patch.object(aw, "get_or_create_user")
+        self._user_db_patcher.start()
 
     def teardown_method(self):
         import parse_video_py.auth_web as aw
@@ -1532,6 +1534,7 @@ class TestAuthWeb:
         # 恢复 content_security 模块常量
         cs.OPENID_SIGNING_KEY = self._orig_signing_key
         cs.OPENID_TOKEN_TTL = self._orig_token_ttl
+        self._user_db_patcher.stop()
 
     # ------------------------------------------------------------------
     # 成功场景
@@ -1553,7 +1556,8 @@ class TestAuthWeb:
              patch.object(self.aw, "OPENID_TOKEN_TTL", 7200), \
              patch.object(
                  self.aw, "_call_code2session", return_value=mock_wx_response
-             ):
+             ), \
+             patch.object(self.aw, "get_or_create_user") as get_user:
             response = self.client.post(
                 "/auth/wechat-login",
                 json={"code": "valid_wx_code_123"},
@@ -1567,6 +1571,9 @@ class TestAuthWeb:
         assert data["data"]["expiresIn"] == 7200
         # 验证 token 不为空
         assert len(data["data"]["openidToken"]) > 0
+        get_user.assert_called_once_with(
+            "o_test_user_abc123", "u_test_union"
+        )
 
     def test_login_does_not_leak_openid_or_session_key(self):
         """响应中不包含原始 openid、session_key 或签名密钥。"""

@@ -18,7 +18,7 @@ import time
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, FastAPI, HTTPException, Request, status
+from fastapi import APIRouter, FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 
 from parse_video_py.content_security import (
@@ -29,6 +29,16 @@ from parse_video_py.content_security import (
     WxSecurityConfigError,
     WxSecurityServiceError,
     create_openid_token,
+    verify_openid_token,
+)
+from parse_video_py.user_db import get_or_create_user
+from parse_video_py.qr_auth import (
+    confirm_qr_login,
+    create_qr_login,
+    create_web_session,
+    exchange_login_ticket,
+    get_qr_status,
+    verify_web_session,
 )
 
 logger = logging.getLogger("auth_web")
@@ -283,7 +293,17 @@ async def wechat_login(request: Request):
             detail="微信登录返回数据异常",
         )
 
-    # ---- 4. 签发 openidToken（不返回原始 openid） ----
+    # ---- 4. 幂等绑定统一系统用户（不改变现有接口响应） ----
+    try:
+        get_or_create_user(openid, wx_data.get("unionid"))
+    except Exception as exc:
+        logger.exception("统一用户写入失败")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="用户服务暂不可用，请稍后重试",
+        ) from exc
+
+    # ---- 5. 签发 openidToken（不返回原始 openid） ----
     try:
         token = create_openid_token(openid)
     except WxSecurityConfigError as exc:
@@ -303,6 +323,103 @@ async def wechat_login(request: Request):
         "openidToken": token,
         "expiresIn": expires_in,
     })
+
+
+@router.post("/qr/create")
+def create_qr():
+    """Create a three-minute mini-program code for web login."""
+    try:
+        return create_qr_login(WX_APPID, WX_APPSECRET)
+    except Exception as exc:
+        logger.exception("创建网页登录小程序码失败")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="小程序码登录暂不可用",
+        ) from exc
+
+
+@router.get("/qr/status/{scene_token}")
+def qr_status(scene_token: str):
+    try:
+        return get_qr_status(scene_token)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/qr/confirm")
+async def confirm_qr(
+    request: Request,
+    authorization: str | None = Header(default=None),
+):
+    """Confirm web login with the existing mini-program openidToken."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="缺少 openidToken")
+    try:
+        openid = verify_openid_token(authorization[7:].strip())
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="openidToken 无效或已过期") from exc
+    try:
+        body = await request.json()
+        scene_token = str(body.get("scene_token") or "").strip()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象") from exc
+    if not scene_token:
+        raise HTTPException(status_code=400, detail="scene_token 不能为空")
+    try:
+        user = get_or_create_user(openid)
+        confirm_qr_login(scene_token, user.id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("确认网页登录失败")
+        raise HTTPException(status_code=503, detail="用户服务暂不可用") from exc
+    return api_response(0, "ok", {"status": "confirmed"})
+
+
+@router.post("/qr/exchange")
+async def exchange_qr(request: Request, response: Response):
+    try:
+        body = await request.json()
+        login_ticket = str(body.get("login_ticket") or "").strip()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象") from exc
+    if not login_ticket:
+        raise HTTPException(status_code=400, detail="login_ticket 不能为空")
+    try:
+        user = exchange_login_ticket(login_ticket)
+        session_token = create_web_session(user.id)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    response.set_cookie(
+        key="web_session", value=session_token, max_age=30 * 24 * 60 * 60,
+        httponly=True,
+        secure=os.getenv("WEB_COOKIE_SECURE", "false").lower() == "true",
+        samesite="lax", path="/",
+    )
+    return {"status": "ok"}
+
+
+@router.get("/me")
+def current_user(request: Request):
+    token = request.cookies.get("web_session", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="未登录")
+    try:
+        user = verify_web_session(token)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    return {"user": {
+        "id": user.id,
+        "internal_code": user.internal_code,
+        "display_name": user.display_name or "",
+        "avatar_url": user.avatar_url,
+    }}
+
+
+@router.post("/logout", status_code=204)
+def logout(response: Response):
+    response.delete_cookie("web_session", path="/")
+    return response
 
 
 # ---------------------------------------------------------------------------

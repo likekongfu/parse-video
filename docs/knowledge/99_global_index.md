@@ -54,6 +54,7 @@ last_scanned_at: 2026-06-08
 | `parser/__init__.py:parse_video_id()` | 视频 ID 解析入口 | 核心业务流程 | 高 |
 | `web.py:app` | FastAPI 应用实例 | Web 服务 | 高 |
 | `web.py:_build_auth_dependency()` | Basic Auth 动态构建 | 鉴权 | 高 |
+| `user_db.py:get_or_create_user()` | OpenID/UnionID→统一系统用户 | 小程序登录、网页扫码登录 | 高 |
 | `utils.py:extract_url()` | URL 提取正则匹配 | 所有解析入口 | 中 |
 | `utils.py:create_async_client()` | HTTP 客户端工厂（代理注入） | 所有解析器 HTTP 请求 | 高 |
 | `cli/_parse.py:run_parse()` | CLI 解析命令入口 | CLI 批量解析 | 中 |
