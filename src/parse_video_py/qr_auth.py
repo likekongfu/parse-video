@@ -13,7 +13,7 @@ import uuid
 
 import httpx
 import qrcode
-from sqlalchemy import insert, select, update
+from sqlalchemy import insert, or_, select, update
 
 from parse_video_py.user_db import (
     SystemUser, _engine, init_user_database, qr_login_sessions, users,
@@ -139,18 +139,82 @@ def get_qr_status(scene_token: str) -> dict[str, str]:
         return {"status": "confirmed", "login_ticket": ticket}
 
 
-def confirm_qr_login(scene_token: str, user_id: str) -> None:
+def mark_qr_scanned(scene_token: str, user_id: str) -> None:
+    """Bind the scan to one authenticated mini-program user, idempotently."""
     now = int(time.time())
+    scene_hash = _hash(scene_token)
     with _engine.begin() as conn:
         result = conn.execute(update(qr_login_sessions).where(
-            qr_login_sessions.c.scene_token_hash == _hash(scene_token),
+            qr_login_sessions.c.scene_token_hash == scene_hash,
             qr_login_sessions.c.expires_at > now,
-            qr_login_sessions.c.status.in_(["waiting", "scanned"]),
+            qr_login_sessions.c.status == "waiting",
+        ).values(user_id=user_id, status="scanned", updated_at=now))
+        if result.rowcount == 1:
+            return
+        row = conn.execute(select(qr_login_sessions).where(
+            qr_login_sessions.c.scene_token_hash == scene_hash
+        )).mappings().first()
+        if not row or row["expires_at"] <= now:
+            raise ValueError("小程序码无效或已过期")
+        if row["status"] == "scanned" and row["user_id"] == user_id:
+            return
+        if row["status"] == "scanned":
+            raise ValueError("登录会话已由其他用户扫码")
+        raise ValueError("登录会话已确认或取消")
+
+
+def confirm_qr_login(scene_token: str, user_id: str) -> None:
+    now = int(time.time())
+    scene_hash = _hash(scene_token)
+    with _engine.begin() as conn:
+        result = conn.execute(update(qr_login_sessions).where(
+            qr_login_sessions.c.scene_token_hash == scene_hash,
+            qr_login_sessions.c.expires_at > now,
+            or_(
+                qr_login_sessions.c.status == "waiting",
+                (
+                    (qr_login_sessions.c.status == "scanned")
+                    & (qr_login_sessions.c.user_id == user_id)
+                ),
+            ),
         ).values(
             user_id=user_id, status="confirmed", confirmed_at=now, updated_at=now,
         ))
         if result.rowcount != 1:
+            row = conn.execute(select(qr_login_sessions).where(
+                qr_login_sessions.c.scene_token_hash == scene_hash
+            )).mappings().first()
+            if row and row["status"] == "scanned" and row["user_id"] != user_id:
+                raise ValueError("登录会话已由其他用户扫码，不能确认")
+            if row and row["status"] == "cancelled":
+                raise ValueError("登录会话已取消")
             raise ValueError("小程序码无效、已过期或已确认")
+
+
+def cancel_qr_login(scene_token: str, user_id: str) -> None:
+    """Cancel only the session scanned by the same mini-program user."""
+    now = int(time.time())
+    scene_hash = _hash(scene_token)
+    with _engine.begin() as conn:
+        result = conn.execute(update(qr_login_sessions).where(
+            qr_login_sessions.c.scene_token_hash == scene_hash,
+            qr_login_sessions.c.expires_at > now,
+            qr_login_sessions.c.status == "scanned",
+            qr_login_sessions.c.user_id == user_id,
+        ).values(status="cancelled", updated_at=now))
+        if result.rowcount == 1:
+            return
+        row = conn.execute(select(qr_login_sessions).where(
+            qr_login_sessions.c.scene_token_hash == scene_hash
+        )).mappings().first()
+        if (
+            row and row["expires_at"] > now and row["status"] == "cancelled"
+            and row["user_id"] == user_id
+        ):
+            return
+        if row and row["status"] == "scanned" and row["user_id"] != user_id:
+            raise ValueError("不能取消其他用户的登录会话")
+        raise ValueError("小程序码无效、已过期、已确认或已取消")
 
 
 def exchange_login_ticket(login_ticket: str) -> SystemUser:

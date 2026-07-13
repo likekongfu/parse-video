@@ -95,10 +95,14 @@ confidence: high
 
 1. 网页调用 `POST /auth/qr/create` 获取三分钟有效的小程序码与 scene_token。
 2. 网页每两秒调用 `GET /auth/qr/status/{scene_token}`。
-3. 小程序确认页复用 openidToken，通过 `Authorization: Bearer` 调用 `POST /auth/qr/confirm`。
-4. confirmed 状态签发一次性 login_ticket。
-5. 网页调用 `POST /auth/qr/exchange`，成功后设置 HttpOnly `web_session` Cookie。
-6. `GET /auth/me` 恢复用户，`POST /auth/logout` 清除 Cookie。
+3. 小程序确认页复用 openidToken，通过 `POST /auth/qr/scan` 将会话标记为 scanned 并绑定统一 user_id。
+4. 用户确认时调用 `POST /auth/qr/confirm`；只有已绑定用户可以确认该 scanned 会话。
+5. 用户取消时调用 `POST /auth/qr/cancel`，网页轮询得到 cancelled 状态。
+6. confirmed 状态签发一次性 login_ticket。
+7. 网页调用 `POST /auth/qr/exchange`，成功后设置 HttpOnly `web_session` Cookie。
+8. `GET /auth/me` 恢复用户，`POST /auth/logout` 清除 Cookie。
+
+小程序请求 scan、confirm 或 cancel 收到 401 时，会清理缓存 openidToken，重新调用 wx.login 和 `/auth/wechat-login`，然后只重试一次原请求。
 
 ---
 

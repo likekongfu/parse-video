@@ -33,11 +33,13 @@ from parse_video_py.content_security import (
 )
 from parse_video_py.user_db import get_or_create_user
 from parse_video_py.qr_auth import (
+    cancel_qr_login,
     confirm_qr_login,
     create_qr_login,
     create_web_session,
     exchange_login_ticket,
     get_qr_status,
+    mark_qr_scanned,
     verify_web_session,
 )
 
@@ -374,6 +376,55 @@ async def confirm_qr(
         logger.exception("确认网页登录失败")
         raise HTTPException(status_code=503, detail="用户服务暂不可用") from exc
     return api_response(0, "ok", {"status": "confirmed"})
+
+
+async def _authenticated_qr_action(
+    request: Request,
+    authorization: str | None,
+    action,
+) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="缺少 openidToken")
+    try:
+        openid = verify_openid_token(authorization[7:].strip())
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="openidToken 无效或已过期") from exc
+    try:
+        body = await request.json()
+        scene_token = str(body.get("scene_token") or "").strip()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象") from exc
+    if not scene_token:
+        raise HTTPException(status_code=400, detail="scene_token 不能为空")
+    try:
+        user = get_or_create_user(openid)
+        action(scene_token, user.id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("更新网页登录状态失败")
+        raise HTTPException(status_code=503, detail="用户服务暂不可用") from exc
+    return scene_token
+
+
+@router.post("/qr/scan")
+async def scan_qr(
+    request: Request,
+    authorization: str | None = Header(default=None),
+):
+    """Mark a scene as scanned and bind it to the authenticated mini-program user."""
+    await _authenticated_qr_action(request, authorization, mark_qr_scanned)
+    return api_response(0, "ok", {"status": "scanned"})
+
+
+@router.post("/qr/cancel")
+async def cancel_qr(
+    request: Request,
+    authorization: str | None = Header(default=None),
+):
+    """Cancel a scene previously scanned by the same mini-program user."""
+    await _authenticated_qr_action(request, authorization, cancel_qr_login)
+    return api_response(0, "ok", {"status": "cancelled"})
 
 
 @router.post("/qr/exchange")

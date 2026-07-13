@@ -80,3 +80,4 @@ source_commit: dd55df3
 - 不得将用户库变更耦合到内容安全审核接口。
 - 二维码 scene 和 login_ticket 必须使用强随机值并仅存哈希；ticket 必须原子单次兑换。
 - 小程序确认必须验证既有 openidToken，不能信任客户端提交的 user_id 或 openid。
+- scanned 会话必须绑定从 openidToken 解析出的统一 user_id，其他用户不得确认或取消。
