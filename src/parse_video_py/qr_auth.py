@@ -35,6 +35,13 @@ def _hash(value: str) -> bytes:
     return hmac.new(_key(), value.encode(), hashlib.sha256).digest()
 
 
+def _ticket_for_session(session_id: str) -> str:
+    digest = hmac.new(
+        _key(), f"qr-login-ticket:{session_id}".encode(), hashlib.sha256
+    ).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+
+
 def _data_uri(image: bytes) -> str:
     return "data:image/png;base64," + base64.b64encode(image).decode()
 
@@ -123,10 +130,12 @@ def get_qr_status(scene_token: str) -> dict[str, str]:
             return {"status": "expired"}
         if row["status"] != "confirmed":
             return {"status": str(row["status"])}
-        ticket = secrets.token_urlsafe(48)
-        conn.execute(update(qr_login_sessions).where(
-            qr_login_sessions.c.id == row["id"]
-        ).values(login_ticket_hash=_hash(ticket), updated_at=now))
+        ticket = _ticket_for_session(str(row["id"]))
+        ticket_hash = _hash(ticket)
+        if row["login_ticket_hash"] != ticket_hash:
+            conn.execute(update(qr_login_sessions).where(
+                qr_login_sessions.c.id == row["id"]
+            ).values(login_ticket_hash=ticket_hash, updated_at=now))
         return {"status": "confirmed", "login_ticket": ticket}
 
 

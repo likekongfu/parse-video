@@ -40,6 +40,8 @@ def test_qr_login_service_full_flow_and_one_time_ticket(isolated_qr_db):
     status_result = qr_auth.get_qr_status(scene)
     assert status_result["status"] == "confirmed"
     ticket = status_result["login_ticket"]
+    repeated_status = qr_auth.get_qr_status(scene)
+    assert repeated_status == {"status": "confirmed", "login_ticket": ticket}
     exchanged = qr_auth.exchange_login_ticket(ticket)
     assert exchanged.id == user.id
     with pytest.raises(ValueError, match="已被使用"):
