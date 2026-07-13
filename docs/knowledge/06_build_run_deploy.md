@@ -24,6 +24,12 @@ source_commit: dd55df3
 | `DOCUMENT_CONVERTER_MAX_UPLOAD_BYTES` | 文档转换服务最大上传体积 | 否 | `20971520` | `document_convert_web.py` | `document_convert_web.py` |
 | `DOCUMENT_CONVERTER_PDF_PASSWORD_MIN_LENGTH` | PDF 加密密码最小长度 | 否 | `6` | `document_convert_web.py` | `document_convert_web.py` |
 | `DOCUMENT_CONVERTER_PDF_PASSWORD_MAX_LENGTH` | PDF 加密密码最大长度 | 否 | `32` | `document_convert_web.py` | `document_convert_web.py` |
+| `DEEPSEEK_API_KEY` | DeepSeek API 密钥 | 是 | 必填，无默认值 | `document_summary.py` | `document_summary.py` |
+| `DEEPSEEK_MODEL` | 总结模型 | 否 | `deepseek-v4-flash` | `document_summary.py` | `document_summary.py` |
+| `DEEPSEEK_API_URL` | Chat Completions 地址 | 否 | `https://api.deepseek.com/chat/completions` | `document_summary.py` | `document_summary.py` |
+| `DEEPSEEK_TIMEOUT_SECONDS` | AI 请求超时 | 否 | `120` | `document_summary.py` | `document_summary.py` |
+| `DEEPSEEK_MAX_INPUT_CHARS` | 单次总结最大输入字符数；超出时取开头和结尾并返回 source_truncated | 否 | `100000` | `document_summary.py` | `document_summary.py` |
+| `DOCUMENT_SUMMARY_UPLOAD_DIR` | 总结文档持久化目录 | 否 | `data/document-summary` | `document_summary_web.py` | `document_summary_web.py` |
 
 ## 安装依赖
 
@@ -113,7 +119,15 @@ docker build -t parse-video-py .
 
 ## 数据库初始化/迁移
 
-当前项目无数据库，不需要初始化或迁移。
+统一用户和文档总结使用 MySQL；部署文档总结前执行：
+
+```bash
+python scripts/migrate_unified_users.py
+mysql -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$MYSQL_USER" -p "$MYSQL_DATABASE" \
+  < migrations/20260713_document_summary.sql
+```
+
+媒体容器需要继续挂载 `/app/data`，以持久化 `DOCUMENT_SUMMARY_UPLOAD_DIR` 下的上传文件。
 
 ## 常见问题
 

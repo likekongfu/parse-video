@@ -14,6 +14,10 @@ def test_qr_hash_columns_use_indexable_mysql_type():
     assert "scene_token_hash VARBINARY(32)" in ddl
     assert "login_ticket_hash VARBINARY(32)" in ddl
 
+    document_ddl = str(CreateTable(user_db.documents).compile(dialect=mysql.dialect()))
+    assert "LONGTEXT" in document_ddl
+    assert "uq_documents_user_content_hash" in document_ddl
+
 
 @pytest.fixture()
 def isolated_user_db(monkeypatch, tmp_path):

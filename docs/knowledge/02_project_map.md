@@ -83,7 +83,10 @@ confidence: high
 - `web.py`：素材记录缓存。
 - `user_db.py`：`users`、`user_identities`、`qr_login_sessions`。
 - `qr_auth.py`：小程序码生成、状态、一次性 ticket 和网页 Cookie 会话。
+- `document_summary.py`：PDF/DOCX 文本和结构化总结缓存。
+- `document_summary_web.py`：登录用户文档上传、解析、总结和历史路由。
 - `migrations/20260713_unified_users.sql`：MySQL 建表迁移。
+- `migrations/20260713_document_summary.sql`：`documents` 与 `document_tasks` 建表迁移。
 
 ## API 路由
 
@@ -93,6 +96,11 @@ confidence: high
 | GET | `/video/share/url/parse` | 分享链接解析 | `web.py:share_url_parse` | `web.py:75` |
 | GET | `/video/id/parse` | 视频 ID 解析 | `web.py:video_id_parse` | `web.py:98` |
 | MCP | `/mcp` | AI 工具集成 | FastApiMCP 自动注册 | `web.py:26-27,114` |
+| POST | `/auth/documents/upload` | 上传 PDF/DOCX 并返回 document_id | `document_summary_web.py` | `document_summary_web.py` |
+| POST | `/auth/documents/{id}/parse` | 提取并缓存文档文本 | `document_summary_web.py` | `document_summary_web.py` |
+| POST | `/auth/documents/{id}/summarize` | DeepSeek 结构化总结 | `document_summary_web.py` | `document_summary_web.py` |
+| POST | `/auth/documents/{id}/save` | 保存到用户历史 | `document_summary_web.py` | `document_summary_web.py` |
+| GET | `/auth/documents/history` | 查询用户保存记录 | `document_summary_web.py` | `document_summary_web.py` |
 
 ## 环境变量
 

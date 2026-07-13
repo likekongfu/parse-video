@@ -24,6 +24,8 @@ web = [
     "jinja2>=3.1",
     "python-multipart>=0.0.20",
     "fastapi-mcp>=0.4",
+    "PyMuPDF>=1.24",
+    "python-docx>=1.1",
 ]
 document = [
     "pdf2docx>=0.5.12",

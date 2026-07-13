@@ -16,10 +16,10 @@ from urllib.parse import quote_plus
 
 from sqlalchemy import (
     BigInteger, Column, ForeignKey, Index, LargeBinary, MetaData, String, Table,
-    UniqueConstraint, create_engine, insert, select,
+    Text, UniqueConstraint, create_engine, insert, select,
 )
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.dialects.mysql import VARBINARY
+from sqlalchemy.dialects.mysql import LONGTEXT, VARBINARY
 
 _metadata = MetaData()
 _hash_binary_type = LargeBinary(32).with_variant(VARBINARY(32), "mysql")
@@ -61,6 +61,44 @@ qr_login_sessions = Table(
     Column("created_at", BigInteger, nullable=False),
     Column("updated_at", BigInteger, nullable=False),
     Index("ix_qr_login_sessions_status_expires", "status", "expires_at"),
+)
+
+_long_text_type = Text().with_variant(LONGTEXT(), "mysql")
+
+documents = Table(
+    "documents", _metadata,
+    Column("id", String(36), primary_key=True),
+    Column("user_id", String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
+    Column("filename", String(255), nullable=False),
+    Column("file_type", String(10), nullable=False),
+    Column("file_size", BigInteger, nullable=False),
+    Column("content_hash", _hash_binary_type, nullable=False),
+    Column("storage_path", String(1024), nullable=False),
+    Column("extracted_text", _long_text_type, nullable=True),
+    Column("extraction_status", String(20), nullable=False),
+    Column("summary_json", _long_text_type, nullable=True),
+    Column("summary_status", String(20), nullable=False),
+    Column("error_message", String(1000), nullable=True),
+    Column("saved_at", BigInteger, nullable=True),
+    Column("created_at", BigInteger, nullable=False),
+    Column("updated_at", BigInteger, nullable=False),
+    UniqueConstraint("user_id", "content_hash", name="uq_documents_user_content_hash"),
+    Index("ix_documents_user_created", "user_id", "created_at"),
+)
+
+document_tasks = Table(
+    "document_tasks", _metadata,
+    Column("id", String(36), primary_key=True),
+    Column("document_id", String(36), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False),
+    Column("user_id", String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
+    Column("task_type", String(32), nullable=False),
+    Column("status", String(20), nullable=False),
+    Column("error_message", String(1000), nullable=True),
+    Column("created_at", BigInteger, nullable=False),
+    Column("updated_at", BigInteger, nullable=False),
+    Column("completed_at", BigInteger, nullable=True),
+    UniqueConstraint("document_id", "task_type", name="uq_document_tasks_document_type"),
+    Index("ix_document_tasks_user_created", "user_id", "created_at"),
 )
 
 

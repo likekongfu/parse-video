@@ -104,6 +104,16 @@ confidence: high
 
 小程序请求 scan、confirm 或 cancel 收到 401 时，会清理缓存 openidToken，重新调用 wx.login 和 `/auth/wechat-login`，然后只重试一次原请求。
 
+### AI 文档总结
+
+1. 已登录网页使用 multipart `file` 调用 `POST /auth/documents/upload`，仅允许 PDF、DOCX 和 5MB 以内文件。
+2. 后端计算 SHA-256；同一用户上传相同内容时复用已有 document_id。
+3. `POST /auth/documents/{id}/parse` 使用 PyMuPDF 或 python-docx 提取并缓存文本；空文本提示使用 OCR。
+4. `POST /auth/documents/{id}/summarize` 调用 DeepSeek JSON Output，缓存 summary、key_points、people、dates、amounts、risks。
+5. `documents.user_id` 和 `document_tasks.user_id` 均绑定网页 Cookie 解析出的 users.id，不接受客户端提交 user_id。
+6. 已完成的解析或总结直接返回缓存；失败状态允许重试，处理中状态禁止重复执行。
+7. 用户通过 save 接口保存结果，并通过 history 接口读取自己的历史记录。
+
 ---
 
 ## 流程：视频 ID 解析

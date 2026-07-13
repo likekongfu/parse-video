@@ -234,3 +234,28 @@ Environment variables:
 - `MATERIAL_DOWNLOAD_TIMEOUT_SECONDS`: upstream download timeout. Default: `120`.
 
 For Docker, mount `data/` if you want records to survive container recreation.
+
+# AI document summary
+
+The authenticated media service exposes a cached PDF/DOCX summary pipeline:
+
+```text
+POST /auth/documents/upload
+POST /auth/documents/{document_id}/parse
+POST /auth/documents/{document_id}/summarize
+POST /auth/documents/{document_id}/save
+GET  /auth/documents/history
+```
+
+Configure the production container with:
+
+```dotenv
+DEEPSEEK_API_KEY=replace-with-server-side-api-key
+DEEPSEEK_MODEL=deepseek-v4-flash
+DEEPSEEK_API_URL=https://api.deepseek.com/chat/completions
+DEEPSEEK_TIMEOUT_SECONDS=120
+DEEPSEEK_MAX_INPUT_CHARS=100000
+DOCUMENT_SUMMARY_UPLOAD_DIR=/app/data/document-summary
+```
+
+Apply `migrations/20260713_document_summary.sql` to the same MySQL database used by the unified user tables. Never expose `DEEPSEEK_API_KEY` to the browser or mini-program.
