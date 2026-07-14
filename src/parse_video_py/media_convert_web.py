@@ -29,6 +29,7 @@ from parse_video_py.content_security import WX_CONTENT_SECURITY_STRICT as _SEC_S
 # 微信小程序登录
 from parse_video_py.auth_web import router as auth_router
 from parse_video_py.document_summary_web import router as document_summary_router
+from parse_video_py.document_translation_web import router as document_translation_router
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +115,7 @@ app = FastAPI(
 # 挂载微信小程序登录路由（公网地址: /parse/media-converter/auth/wechat-login）
 app.include_router(auth_router)
 app.include_router(document_summary_router)
+app.include_router(document_translation_router)
 
 
 # ---------------------------------------------------------------------------

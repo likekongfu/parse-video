@@ -76,6 +76,8 @@ documents = Table(
     Column("storage_path", String(1024), nullable=False),
     Column("extracted_text", _long_text_type, nullable=True),
     Column("extraction_status", String(20), nullable=False),
+    Column("document_type", String(32), nullable=True),
+    Column("document_type_source", String(20), nullable=True),
     Column("summary_json", _long_text_type, nullable=True),
     Column("summary_status", String(20), nullable=False),
     Column("error_message", String(1000), nullable=True),
@@ -99,6 +101,31 @@ document_tasks = Table(
     Column("completed_at", BigInteger, nullable=True),
     UniqueConstraint("document_id", "task_type", name="uq_document_tasks_document_type"),
     Index("ix_document_tasks_user_created", "user_id", "created_at"),
+)
+
+document_translations = Table(
+    "document_translations", _metadata,
+    Column("id", String(36), primary_key=True),
+    Column("document_id", String(36), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False),
+    Column("user_id", String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
+    Column("options_hash", _hash_binary_type, nullable=False),
+    Column("source_language", String(32), nullable=False),
+    Column("detected_source_language", String(32), nullable=True),
+    Column("target_language", String(32), nullable=False),
+    Column("mode", String(20), nullable=False),
+    Column("style", String(20), nullable=False),
+    Column("glossary_json", _long_text_type, nullable=True),
+    Column("result_json", _long_text_type, nullable=True),
+    Column("status", String(20), nullable=False),
+    Column("error_message", String(1000), nullable=True),
+    Column("created_at", BigInteger, nullable=False),
+    Column("updated_at", BigInteger, nullable=False),
+    Column("completed_at", BigInteger, nullable=True),
+    UniqueConstraint(
+        "document_id", "user_id", "options_hash",
+        name="uq_document_translations_document_options",
+    ),
+    Index("ix_document_translations_user_created", "user_id", "created_at"),
 )
 
 

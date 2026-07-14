@@ -83,10 +83,14 @@ confidence: high
 - `web.py`：素材记录缓存。
 - `user_db.py`：`users`、`user_identities`、`qr_login_sessions`。
 - `qr_auth.py`：小程序码生成、状态、一次性 ticket 和网页 Cookie 会话。
-- `document_summary.py`：PDF/DOCX 文本和结构化总结缓存。
+- `document_summary.py`：PDF/DOCX 文本、20 类文档识别、动态总结卡片和结构化总结缓存。
 - `document_summary_web.py`：登录用户文档上传、解析、总结和历史路由。
+- `document_translation.py`：按标题/段落分块调用 DeepSeek，并缓存翻译和导出结果。
+- `document_translation_web.py`：登录用户翻译与 DOCX/TXT 导出路由。
 - `migrations/20260713_unified_users.sql`：MySQL 建表迁移。
 - `migrations/20260713_document_summary.sql`：`documents` 与 `document_tasks` 建表迁移。
+- `migrations/20260713_document_summary_types.sql`：已建库环境增加文档类型与类型来源字段。
+- `migrations/20260713_document_translation.sql`：`document_translations` 建表迁移。
 
 ## API 路由
 
@@ -98,9 +102,11 @@ confidence: high
 | MCP | `/mcp` | AI 工具集成 | FastApiMCP 自动注册 | `web.py:26-27,114` |
 | POST | `/auth/documents/upload` | 上传 PDF/DOCX 并返回 document_id | `document_summary_web.py` | `document_summary_web.py` |
 | POST | `/auth/documents/{id}/parse` | 提取并缓存文档文本 | `document_summary_web.py` | `document_summary_web.py` |
-| POST | `/auth/documents/{id}/summarize` | DeepSeek 结构化总结 | `document_summary_web.py` | `document_summary_web.py` |
+| POST | `/auth/documents/{id}/summarize` | DeepSeek 自动分类与动态结构化总结；可选 document_type/regenerate 手动重生成 | `document_summary_web.py` | `document_summary_web.py` |
 | POST | `/auth/documents/{id}/save` | 保存到用户历史 | `document_summary_web.py` | `document_summary_web.py` |
 | GET | `/auth/documents/history` | 查询用户保存记录 | `document_summary_web.py` | `document_summary_web.py` |
+| POST | `/auth/documents/{id}/translate` | 按语言、模式、风格和术语表翻译 | `document_translation_web.py` | `document_translation_web.py` |
+| GET | `/auth/documents/{id}/translations/{translation_id}/export` | 导出 DOCX/TXT | `document_translation_web.py` | `document_translation_web.py` |
 
 ## 环境变量
 

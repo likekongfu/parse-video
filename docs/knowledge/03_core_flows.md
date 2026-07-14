@@ -109,10 +109,22 @@ confidence: high
 1. 已登录网页使用 multipart `file` 调用 `POST /auth/documents/upload`，仅允许 PDF、DOCX 和 5MB 以内文件。
 2. 后端计算 SHA-256；同一用户上传相同内容时复用已有 document_id。
 3. `POST /auth/documents/{id}/parse` 使用 PyMuPDF 或 python-docx 提取并缓存文本；空文本提示使用 OCR。
-4. `POST /auth/documents/{id}/summarize` 调用 DeepSeek JSON Output，缓存 summary、key_points、people、dates、amounts、risks。
-5. `documents.user_id` 和 `document_tasks.user_id` 均绑定网页 Cookie 解析出的 users.id，不接受客户端提交 user_id。
-6. 已完成的解析或总结直接返回缓存；失败状态允许重试，处理中状态禁止重复执行。
-7. 用户通过 save 接口保存结果，并通过 history 接口读取自己的历史记录。
+4. `POST /auth/documents/{id}/summarize` 调用 DeepSeek JSON Output，从 20 类文档类型中自动识别，无法判断时使用 general。
+5. 响应保留 summary、key_points、people、dates、amounts、risks，并新增 document_type、risk_notice 与 4-6 个非空 summary_sections 动态卡片。
+6. 客户端可向同一接口提交 document_type 和 regenerate=true，覆盖自动类型并对同一 document_id 重新生成；类型来源记录为 manual。
+7. 医疗、法律、财务类额外返回专业复核风险提示，不能替代医疗诊断、法律意见或财务建议。
+8. `documents.user_id` 和 `document_tasks.user_id` 均绑定网页 Cookie 解析出的 users.id，不接受客户端提交 user_id。
+9. 已完成的解析或总结直接返回缓存；失败状态允许重试，处理中状态禁止重复执行。
+10. 用户通过 save 接口保存结果，并通过 history 接口读取自己的历史记录。
+
+### AI 文档翻译
+
+1. 复用文档上传和解析接口，PDF/DOCX 限制仍为 5MB，扫描 PDF 继续提示先使用 OCR。
+2. 前端提交源语言、目标语言、仅译文/双语模式、通用/商务/法律/技术风格和可选术语表。
+3. `document_translation.py` 按标题和段落生成稳定的 segment_id，并按整段批量调用 DeepSeek，不逐句请求。
+4. 后端校验 DeepSeek JSON 的 segment_id 完整性和顺序，结果绑定 Cookie 中的 users.id。
+5. `document_translations` 使用文档、用户和规范化选项哈希唯一缓存；相同配置直接复用，不同配置创建独立任务。
+6. 完成结果可预览、复制，并由登录鉴权接口导出 DOCX 或 TXT。
 
 ---
 

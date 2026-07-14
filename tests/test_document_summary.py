@@ -19,7 +19,8 @@ import parse_video_py.user_db as user_db
 def summary_app(monkeypatch, tmp_path):
     engine = create_engine(
         f"sqlite+pysqlite:///{(tmp_path / 'summary.db').as_posix()}",
-        connect_args={"check_same_thread": False}, future=True,
+        connect_args={"check_same_thread": False},
+        future=True,
     )
     monkeypatch.setattr(user_db, "_engine", engine)
     monkeypatch.setattr(summary_service, "_engine", engine)
@@ -32,7 +33,9 @@ def summary_app(monkeypatch, tmp_path):
         yield TestClient(app), user, engine
 
 
-def _pdf_bytes(text: str = "合同总金额 100 万元，负责人张三，截止日期 2026-08-01。") -> bytes:
+def _pdf_bytes(
+    text: str = "合同总金额 100 万元，负责人张三，截止日期 2026-08-01。",
+) -> bytes:
     document = fitz.open()
     page = document.new_page()
     page.insert_text((72, 72), text, fontname="china-s")
@@ -75,10 +78,13 @@ def test_pdf_upload_parse_summary_cache_and_history(summary_app):
     )
     assert parsed.status_code == 200
     assert parsed.json()["text_length"] > 0
-    assert client.post(
-        f"/auth/documents/{document_id}/parse",
-        cookies={"web_session": "session"},
-    ).json()["cached"] is True
+    assert (
+        client.post(
+            f"/auth/documents/{document_id}/parse",
+            cookies={"web_session": "session"},
+        ).json()["cached"]
+        is True
+    )
 
     ai_result = {
         "summary": "这是一份合同摘要。",
@@ -100,6 +106,8 @@ def test_pdf_upload_parse_summary_cache_and_history(summary_app):
         )
     assert first.status_code == 200
     assert first.json()["summary"] == ai_result["summary"]
+    assert first.json()["document_type"] == "general"
+    assert first.json()["summary_sections"][0]["title"] == "关键要点"
     assert second.json()["cached"] is True
     assert mocked_ai.await_count == 1
 
@@ -115,9 +123,11 @@ def test_pdf_upload_parse_summary_cache_and_history(summary_app):
     assert history[0]["summary"]["people"] == ["张三"]
 
     with engine.connect() as conn:
-        task_count = conn.execute(select(func.count()).select_from(
-            user_db.document_tasks
-        ).where(user_db.document_tasks.c.user_id == user.id)).scalar_one()
+        task_count = conn.execute(
+            select(func.count())
+            .select_from(user_db.document_tasks)
+            .where(user_db.document_tasks.c.user_id == user.id)
+        ).scalar_one()
     assert task_count == 2
 
 
@@ -125,7 +135,13 @@ def test_docx_upload_and_parse(summary_app):
     client, _, _ = summary_app
     uploaded = client.post(
         "/auth/documents/upload",
-        files={"file": ("plan.docx", _docx_bytes(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+        files={
+            "file": (
+                "plan.docx",
+                _docx_bytes(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
         cookies={"web_session": "session"},
     )
     assert uploaded.status_code == 200
@@ -177,7 +193,13 @@ def test_upload_rejects_unauthenticated_invalid_and_oversized_files(summary_app)
 
     oversized = client.post(
         "/auth/documents/upload",
-        files={"file": ("large.pdf", b"%PDF-" + b"x" * (5 * 1024 * 1024), "application/pdf")},
+        files={
+            "file": (
+                "large.pdf",
+                b"%PDF-" + b"x" * (5 * 1024 * 1024),
+                "application/pdf",
+            )
+        },
         cookies={"web_session": "session"},
     )
     assert oversized.status_code == 413
@@ -211,10 +233,16 @@ async def test_deepseek_uses_json_output_and_validates_structured_result(monkeyp
 
         def json(self):
             return {
-                "choices": [{"message": {"content": (
-                    '{"summary":"摘要","key_points":["要点"],"people":[],"dates":[],'
-                    '"amounts":[],"risks":[]}'
-                )}}]
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"summary":"摘要","key_points":["要点"],"people":[],"dates":[],'
+                                '"amounts":[],"risks":[]}'
+                            )
+                        }
+                    }
+                ]
             }
 
     class FakeClient:
@@ -252,6 +280,113 @@ async def test_deepseek_network_failure_is_retryable(monkeypatch):
             raise httpx.ConnectError("offline")
 
     monkeypatch.setenv("DEEPSEEK_API_KEY", "secret-key")
-    with patch.object(summary_service.httpx, "AsyncClient", return_value=FailingClient()):
+    with patch.object(
+        summary_service.httpx, "AsyncClient", return_value=FailingClient()
+    ):
         with pytest.raises(summary_service.DocumentSummaryError, match="网络连接失败"):
             await summary_service.call_deepseek("文档正文", "system-user-id")
+
+
+def test_summary_normalization_filters_empty_cards_and_adds_professional_notice():
+    result = summary_service._normalize_summary(
+        {
+            "summary": "医疗记录摘要",
+            "document_type": "medical",
+            "key_points": [],
+            "people": [],
+            "dates": [],
+            "amounts": [],
+            "risks": ["诊断仍需医生复核"],
+            "summary_sections": [
+                {"key": "symptoms", "title": "症状与病史", "items": ["持续咳嗽"]},
+                {"key": "empty", "title": "空卡片", "items": []},
+            ],
+        }
+    )
+
+    assert result["document_type"] == "medical"
+    assert result["document_type_label"] == "医疗文档"
+    assert "不能替代" in result["risk_notice"]
+    assert result["summary_sections"] == [
+        {"key": "symptoms", "title": "症状与病史", "items": ["持续咳嗽"]}
+    ]
+
+
+def test_unknown_document_type_falls_back_to_general():
+    result = summary_service._normalize_summary(
+        {
+            "summary": "普通摘要",
+            "document_type": "unknown_type",
+            "key_points": ["要点"],
+        }
+    )
+    assert result["document_type"] == "general"
+    assert result["document_type_label"] == "通用文档"
+
+
+def test_manual_document_type_regenerates_same_document(summary_app):
+    client, _, engine = summary_app
+    uploaded = client.post(
+        "/auth/documents/upload",
+        files={"file": ("contract.pdf", _pdf_bytes(), "application/pdf")},
+        cookies={"web_session": "session"},
+    )
+    document_id = uploaded.json()["document_id"]
+    assert (
+        client.post(
+            f"/auth/documents/{document_id}/parse",
+            cookies={"web_session": "session"},
+        ).status_code
+        == 200
+    )
+
+    mocked_ai = AsyncMock(
+        return_value={
+            "summary": "法律文书摘要",
+            "document_type": "legal",
+            "key_points": ["争议焦点"],
+            "risks": ["需律师复核"],
+            "summary_sections": [
+                {"key": "legal_issues", "title": "法律问题", "items": ["合同履行争议"]},
+                {"key": "risks", "title": "法律风险", "items": ["需律师复核"]},
+            ],
+        }
+    )
+    with patch.object(summary_service, "call_deepseek", mocked_ai):
+        response = client.post(
+            f"/auth/documents/{document_id}/summarize",
+            json={"document_type": "legal", "regenerate": True},
+            cookies={"web_session": "session"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["document_id"] == document_id
+    assert response.json()["document_type"] == "legal"
+    assert response.json()["risk_notice"]
+    mocked_ai.assert_awaited_once()
+    assert mocked_ai.await_args.args[2] == "legal"
+    with engine.connect() as conn:
+        row = (
+            conn.execute(
+                select(user_db.documents).where(user_db.documents.c.id == document_id)
+            )
+            .mappings()
+            .one()
+        )
+    assert row["document_type"] == "legal"
+    assert row["document_type_source"] == "manual"
+
+
+def test_rejects_unsupported_manual_document_type(summary_app):
+    client, _, _ = summary_app
+    uploaded = client.post(
+        "/auth/documents/upload",
+        files={"file": ("contract.pdf", _pdf_bytes(), "application/pdf")},
+        cookies={"web_session": "session"},
+    )
+    response = client.post(
+        f"/auth/documents/{uploaded.json()['document_id']}/summarize",
+        json={"document_type": "not-supported", "regenerate": True},
+        cookies={"web_session": "session"},
+    )
+    assert response.status_code == 400

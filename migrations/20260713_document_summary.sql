@@ -8,6 +8,8 @@ CREATE TABLE IF NOT EXISTS documents (
     storage_path VARCHAR(1024) NOT NULL,
     extracted_text LONGTEXT NULL,
     extraction_status VARCHAR(20) NOT NULL,
+    document_type VARCHAR(32) NULL,
+    document_type_source VARCHAR(20) NULL,
     summary_json LONGTEXT NULL,
     summary_status VARCHAR(20) NOT NULL,
     error_message VARCHAR(1000) NULL,

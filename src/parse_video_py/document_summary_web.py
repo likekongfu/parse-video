@@ -1,4 +1,5 @@
 """Authenticated document upload, parsing, AI summary, and history routes."""
+
 from __future__ import annotations
 
 import os
@@ -7,6 +8,7 @@ import zipfile
 from pathlib import Path
 
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from pydantic import BaseModel
 
 from parse_video_py.document_summary import (
     MAX_UPLOAD_BYTES,
@@ -26,6 +28,13 @@ from parse_video_py.qr_auth import verify_web_session
 router = APIRouter(prefix="/auth/documents", tags=["document-summary"])
 UPLOAD_DIR = Path(os.getenv("DOCUMENT_SUMMARY_UPLOAD_DIR", "data/document-summary"))
 ALLOWED_EXTENSIONS = {".pdf": "pdf", ".docx": "docx"}
+
+
+class SummaryRequest(BaseModel):
+    """Optional controls; an empty request preserves the original API behavior."""
+
+    document_type: str | None = None
+    regenerate: bool = False
 
 
 def _current_user(request: Request):
@@ -84,6 +93,8 @@ def _service_error(exc: Exception) -> HTTPException:
     if isinstance(exc, EmptyDocumentTextError):
         return HTTPException(status_code=422, detail=str(exc))
     if isinstance(exc, DocumentSummaryError):
+        if str(exc) == "不支持的文档类型":
+            return HTTPException(status_code=400, detail=str(exc))
         status_code = 503 if str(exc) == "DeepSeek API 未配置" else 502
         return HTTPException(status_code=status_code, detail=str(exc))
     return HTTPException(status_code=500, detail="文档处理失败")
@@ -136,10 +147,19 @@ def parse_uploaded_document(request: Request, document_id: str):
 
 
 @router.post("/{document_id}/summarize")
-async def summarize_uploaded_document(request: Request, document_id: str):
+async def summarize_uploaded_document(
+    request: Request,
+    document_id: str,
+    payload: SummaryRequest | None = None,
+):
     user = _current_user(request)
     try:
-        return await summarize_document(user.id, document_id)
+        return await summarize_document(
+            user.id,
+            document_id,
+            document_type=payload.document_type if payload else None,
+            regenerate=payload.regenerate if payload else False,
+        )
     except Exception as exc:
         raise _service_error(exc) from exc
 

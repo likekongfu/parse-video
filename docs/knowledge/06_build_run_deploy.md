@@ -30,6 +30,7 @@ source_commit: dd55df3
 | `DEEPSEEK_TIMEOUT_SECONDS` | AI 请求超时 | 否 | `120` | `document_summary.py` | `document_summary.py` |
 | `DEEPSEEK_MAX_INPUT_CHARS` | 单次总结最大输入字符数；超出时取开头和结尾并返回 source_truncated | 否 | `100000` | `document_summary.py` | `document_summary.py` |
 | `DOCUMENT_SUMMARY_UPLOAD_DIR` | 总结文档持久化目录 | 否 | `data/document-summary` | `document_summary_web.py` | `document_summary_web.py` |
+| `DOCUMENT_TRANSLATION_BATCH_CHARS` | 单次翻译批次最大字符数，只在段落边界分批 | 否 | `12000` | `document_translation.py` | `document_translation.py` |
 
 ## 安装依赖
 
@@ -125,6 +126,11 @@ docker build -t parse-video-py .
 python scripts/migrate_unified_users.py
 mysql -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$MYSQL_USER" -p "$MYSQL_DATABASE" \
   < migrations/20260713_document_summary.sql
+# 仅已执行过旧版 document_summary 迁移的现有数据库需要执行：
+mysql -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$MYSQL_USER" -p "$MYSQL_DATABASE" \
+  < migrations/20260713_document_summary_types.sql
+mysql -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$MYSQL_USER" -p "$MYSQL_DATABASE" \
+  < migrations/20260713_document_translation.sql
 ```
 
 媒体容器需要继续挂载 `/app/data`，以持久化 `DOCUMENT_SUMMARY_UPLOAD_DIR` 下的上传文件。
