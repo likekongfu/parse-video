@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS documents (
     UNIQUE KEY uq_documents_user_content_hash (user_id, content_hash),
     KEY ix_documents_user_created (user_id, created_at),
     CONSTRAINT fk_documents_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS document_tasks (
     id VARCHAR(36) NOT NULL PRIMARY KEY,
@@ -35,4 +35,4 @@ CREATE TABLE IF NOT EXISTS document_tasks (
     KEY ix_document_tasks_user_created (user_id, created_at),
     CONSTRAINT fk_document_tasks_document FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE,
     CONSTRAINT fk_document_tasks_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
