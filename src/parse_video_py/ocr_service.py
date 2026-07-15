@@ -6,6 +6,9 @@ import threading
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class OcrUnavailableError(RuntimeError):
@@ -48,7 +51,14 @@ def recognize_images(paths: list[Path]) -> list[dict[str, Any]]:
             try:
                 results = engine.predict(str(path))
             except Exception as exc:
-                raise RuntimeError(f"第 {page_number} 页 OCR 识别失败") from exc
+                logger.exception(
+                    "第 %s 页 OCR 识别失败，图片路径：%s",
+                    page_number,
+                    path,
+                )
+                raise RuntimeError(
+                    f"第 {page_number} 页 OCR 识别失败：" f"{type(exc).__name__}: {exc}"
+                ) from exc
             lines: list[dict[str, Any]] = []
             for result in results or []:
                 lines.extend(_normalize_result(result))
