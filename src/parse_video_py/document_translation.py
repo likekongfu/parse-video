@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import time
@@ -24,7 +25,8 @@ from parse_video_py.user_db import (
 )
 
 PROCESSING_STALE_SECONDS = 10 * 60
-TRANSLATION_BATCH_CHARS = int(os.getenv("DOCUMENT_TRANSLATION_BATCH_CHARS", "12000"))
+TRANSLATION_BATCH_CHARS = int(os.getenv("DOCUMENT_TRANSLATION_BATCH_CHARS", "6000"))
+SINGLE_SEGMENT_RETRIES = 2
 DEEPSEEK_API_URL = os.getenv(
     "DEEPSEEK_API_URL", "https://api.deepseek.com/chat/completions"
 ).strip()
@@ -40,6 +42,7 @@ STYLE_LABELS = {
     "technical": "技术：准确保留技术术语、参数、单位和代码",
 }
 _LANGUAGE_CODE = re.compile(r"^[A-Za-z][A-Za-z0-9-]{0,15}$")
+logger = logging.getLogger(__name__)
 
 
 class DocumentTranslationError(RuntimeError):
@@ -48,6 +51,23 @@ class DocumentTranslationError(RuntimeError):
 
 class DocumentTranslationBusyError(DocumentTranslationError):
     pass
+
+
+class InvalidTranslationResponseError(DocumentTranslationError):
+    """The model response cannot be decoded as a translation payload."""
+
+
+class IncompleteTranslationResponseError(DocumentTranslationError):
+    """The model returned only a usable subset of the requested segments."""
+
+    def __init__(
+        self,
+        translated: list[dict[str, str]],
+        detected_source_language: str | None,
+    ) -> None:
+        super().__init__("AI 返回的翻译段落不完整")
+        self.translated = translated
+        self.detected_source_language = detected_source_language
 
 
 def normalize_glossary(value: Any) -> list[dict[str, str]]:
@@ -166,20 +186,27 @@ def _normalize_ai_result(
     if not isinstance(payload, dict) or not isinstance(
         payload.get("translations"), list
     ):
-        raise DocumentTranslationError("AI 返回的翻译格式无效")
+        raise InvalidTranslationResponseError("AI 返回的翻译格式无效")
     expected_ids = [item["segment_id"] for item in expected_segments]
     translated: dict[str, str] = {}
     for item in payload["translations"]:
         if not isinstance(item, dict):
-            raise DocumentTranslationError("AI 返回的翻译格式无效")
+            raise InvalidTranslationResponseError("AI 返回的翻译格式无效")
         segment_id = str(item.get("segment_id") or "")
         text = str(item.get("translated_text") or "").strip()
+        # Ignore hallucinated/duplicate entries. Required IDs are still checked below,
+        # and only expected translations are ever persisted.
         if segment_id in translated or segment_id not in expected_ids or not text:
-            raise DocumentTranslationError("AI 返回的翻译段落不完整")
+            continue
         translated[segment_id] = text
-    if set(translated) != set(expected_ids):
-        raise DocumentTranslationError("AI 返回的翻译段落不完整")
     detected = str(payload.get("detected_source_language") or "").strip() or None
+    if set(translated) != set(expected_ids):
+        partial = [
+            {"segment_id": segment_id, "translated_text": translated[segment_id]}
+            for segment_id in expected_ids
+            if segment_id in translated
+        ]
+        raise IncompleteTranslationResponseError(partial, detected)
     return detected, [
         {"segment_id": segment_id, "translated_text": translated[segment_id]}
         for segment_id in expected_ids
@@ -248,7 +275,14 @@ async def call_deepseek_translation(
                 json=request_body,
             )
         response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
+        choice = response.json()["choices"][0]
+        finish_reason = choice.get("finish_reason")
+        if finish_reason == "length":
+            logger.warning(
+                "DeepSeek translation output was truncated for %d segments",
+                len(segments),
+            )
+        content = choice["message"]["content"]
         return _normalize_ai_result(json.loads(content), segments)
     except httpx.TimeoutException as exc:
         raise DocumentTranslationError("AI 翻译超时，请重试") from exc
@@ -259,7 +293,126 @@ async def call_deepseek_translation(
     except httpx.RequestError as exc:
         raise DocumentTranslationError("DeepSeek API 网络连接失败，请重试") from exc
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-        raise DocumentTranslationError("AI 返回的翻译格式无效") from exc
+        raise InvalidTranslationResponseError("AI 返回的翻译格式无效") from exc
+
+
+async def translate_batch_with_recovery(
+    segments: list[dict[str, str]],
+    *,
+    source_language: str,
+    target_language: str,
+    style: str,
+    glossary: list[dict[str, str]],
+    user_id: str,
+    single_segment_retries: int = SINGLE_SEGMENT_RETRIES,
+) -> tuple[str | None, list[dict[str, str]]]:
+    """Translate a batch, retrying only missing segments and splitting bad batches."""
+    try:
+        return await call_deepseek_translation(
+            segments,
+            source_language=source_language,
+            target_language=target_language,
+            style=style,
+            glossary=glossary,
+            user_id=user_id,
+        )
+    except IncompleteTranslationResponseError as exc:
+        translated_by_id = {
+            item["segment_id"]: item["translated_text"] for item in exc.translated
+        }
+        missing = [
+            segment
+            for segment in segments
+            if segment["segment_id"] not in translated_by_id
+        ]
+        logger.warning(
+            "DeepSeek omitted %d/%d translation segments; retrying missing IDs",
+            len(missing),
+            len(segments),
+        )
+        if len(missing) == 1 and len(segments) == 1:
+            if single_segment_retries <= 0:
+                raise
+            retry_detected, retry_translated = await translate_batch_with_recovery(
+                missing,
+                source_language=source_language,
+                target_language=target_language,
+                style=style,
+                glossary=glossary,
+                user_id=user_id,
+                single_segment_retries=single_segment_retries - 1,
+            )
+        elif len(missing) == len(segments):
+            midpoint = max(1, len(missing) // 2)
+            retry_detected = None
+            retry_translated = []
+            for smaller_batch in (missing[:midpoint], missing[midpoint:]):
+                if not smaller_batch:
+                    continue
+                detected, translated = await translate_batch_with_recovery(
+                    smaller_batch,
+                    source_language=source_language,
+                    target_language=target_language,
+                    style=style,
+                    glossary=glossary,
+                    user_id=user_id,
+                    single_segment_retries=single_segment_retries,
+                )
+                retry_detected = retry_detected or detected
+                retry_translated.extend(translated)
+        else:
+            retry_detected, retry_translated = await translate_batch_with_recovery(
+                missing,
+                source_language=source_language,
+                target_language=target_language,
+                style=style,
+                glossary=glossary,
+                user_id=user_id,
+                single_segment_retries=single_segment_retries,
+            )
+        translated_by_id.update(
+            (item["segment_id"], item["translated_text"]) for item in retry_translated
+        )
+        return exc.detected_source_language or retry_detected, [
+            {
+                "segment_id": segment["segment_id"],
+                "translated_text": translated_by_id[segment["segment_id"]],
+            }
+            for segment in segments
+        ]
+    except InvalidTranslationResponseError:
+        logger.warning(
+            "DeepSeek returned an invalid translation payload for %d segments",
+            len(segments),
+        )
+        if len(segments) == 1:
+            if single_segment_retries <= 0:
+                raise
+            return await translate_batch_with_recovery(
+                segments,
+                source_language=source_language,
+                target_language=target_language,
+                style=style,
+                glossary=glossary,
+                user_id=user_id,
+                single_segment_retries=single_segment_retries - 1,
+            )
+        midpoint = len(segments) // 2
+        detected_language = None
+        translated_segments = []
+        for smaller_batch in (segments[:midpoint], segments[midpoint:]):
+            detected, translated = await translate_batch_with_recovery(
+                smaller_batch,
+                source_language=source_language,
+                target_language=target_language,
+                style=style,
+                glossary=glossary,
+                user_id=user_id,
+                single_segment_retries=single_segment_retries,
+            )
+            detected_language = detected_language or detected
+            translated_segments.extend(translated)
+        return detected_language, translated_segments
 
 
 def _translation_row(user_id: str, document_id: str, options_hash: bytes):
@@ -403,7 +556,7 @@ async def translate_document(
         detected_language: str | None = None
         resolved_source = options["source_language"]
         for batch in iter_segment_batches(segments):
-            detected, translated = await call_deepseek_translation(
+            detected, translated = await translate_batch_with_recovery(
                 batch,
                 source_language=resolved_source,
                 target_language=options["target_language"],

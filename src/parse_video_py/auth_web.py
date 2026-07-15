@@ -31,7 +31,7 @@ from parse_video_py.content_security import (
     create_openid_token,
     verify_openid_token,
 )
-from parse_video_py.user_db import get_or_create_user
+from parse_video_py.user_db import get_or_create_user, get_wechat_openid_for_user
 from parse_video_py.qr_auth import (
     cancel_qr_login,
     confirm_qr_login,
@@ -439,6 +439,8 @@ async def exchange_qr(request: Request, response: Response):
     try:
         user = exchange_login_ticket(login_ticket)
         session_token = create_web_session(user.id)
+        openid = get_wechat_openid_for_user(user.id)
+        openid_token = create_openid_token(openid)
     except ValueError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     response.set_cookie(
@@ -447,7 +449,11 @@ async def exchange_qr(request: Request, response: Response):
         secure=os.getenv("WEB_COOKIE_SECURE", "false").lower() == "true",
         samesite="lax", path="/",
     )
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "openidToken": openid_token,
+        "expiresIn": OPENID_TOKEN_TTL,
+    }
 
 
 @router.get("/me")

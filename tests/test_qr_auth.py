@@ -37,6 +37,7 @@ def test_qr_login_service_full_flow_and_one_time_ticket(isolated_qr_db):
     assert qr_auth.get_qr_status(scene) == {"status": "waiting"}
 
     user = user_db.get_or_create_user("qr-openid")
+    assert user_db.get_wechat_openid_for_user(user.id) == "qr-openid"
     qr_auth.confirm_qr_login(scene, user.id)
     status_result = qr_auth.get_qr_status(scene)
     assert status_result["status"] == "confirmed"
@@ -134,10 +135,17 @@ def test_qr_routes_keep_expected_contract():
         cancel.assert_called_once_with("scene", "user-id")
 
     with patch.object(auth_web, "exchange_login_ticket", return_value=user), \
-         patch.object(auth_web, "create_web_session", return_value="signed-session"):
+         patch.object(auth_web, "create_web_session", return_value="signed-session"), \
+         patch.object(auth_web, "get_wechat_openid_for_user", return_value="openid"), \
+         patch.object(auth_web, "create_openid_token", return_value="signed-openid-token"):
         response = client.post("/auth/qr/exchange", json={"login_ticket": "ticket"})
         assert response.status_code == 200
         assert response.cookies.get("web_session") == "signed-session"
+        assert response.json() == {
+            "status": "ok",
+            "openidToken": "signed-openid-token",
+            "expiresIn": auth_web.OPENID_TOKEN_TTL,
+        }
 
     with patch.object(auth_web, "verify_web_session", return_value=user):
         first_refresh = client.get("/auth/me")

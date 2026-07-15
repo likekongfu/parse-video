@@ -2,6 +2,7 @@ import io
 import json
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from docx import Document
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -261,3 +262,116 @@ async def test_deepseek_translation_uses_segment_json_and_glossary(monkeypatch):
     assert "Service Agreement" in prompt
     assert "服务协议" in prompt
     assert "USD 1,200" in prompt
+
+
+async def test_incomplete_translation_retries_only_missing_segments():
+    segments = translation_service.segment_document(
+        "Heading\nFirst paragraph.\nSecond paragraph."
+    )
+    requested_ids = []
+
+    async def incomplete_once(requested, **_kwargs):
+        requested_ids.append([item["segment_id"] for item in requested])
+        if len(requested_ids) == 1:
+            payload = {
+                "detected_source_language": "en",
+                "translations": [
+                    {
+                        "segment_id": requested[0]["segment_id"],
+                        "translated_text": "标题",
+                    },
+                    {
+                        "segment_id": requested[1]["segment_id"],
+                        "translated_text": "第一段",
+                    },
+                ],
+            }
+            return translation_service._normalize_ai_result(payload, requested)
+        return "en", [
+            {
+                "segment_id": item["segment_id"],
+                "translated_text": "第二段",
+            }
+            for item in requested
+        ]
+
+    with patch.object(
+        translation_service,
+        "call_deepseek_translation",
+        side_effect=incomplete_once,
+    ):
+        detected, translated = await translation_service.translate_batch_with_recovery(
+            segments,
+            source_language="auto",
+            target_language="zh-CN",
+            style="general",
+            glossary=[],
+            user_id="user-id",
+        )
+
+    assert detected == "en"
+    assert requested_ids == [
+        ["seg-0001", "seg-0002", "seg-0003"],
+        ["seg-0003"],
+    ]
+    assert [item["translated_text"] for item in translated] == [
+        "标题",
+        "第一段",
+        "第二段",
+    ]
+
+
+async def test_invalid_translation_response_splits_batch_and_retries():
+    segments = translation_service.segment_document("Heading\nFirst paragraph.")
+    requested_sizes = []
+
+    async def invalid_batch(requested, **_kwargs):
+        requested_sizes.append(len(requested))
+        if len(requested) > 1:
+            raise translation_service.InvalidTranslationResponseError(
+                "AI 返回的翻译格式无效"
+            )
+        return "en", [
+            {
+                "segment_id": requested[0]["segment_id"],
+                "translated_text": f"译文 {requested[0]['segment_id']}",
+            }
+        ]
+
+    with patch.object(
+        translation_service,
+        "call_deepseek_translation",
+        side_effect=invalid_batch,
+    ):
+        _, translated = await translation_service.translate_batch_with_recovery(
+            segments,
+            source_language="auto",
+            target_language="zh-CN",
+            style="general",
+            glossary=[],
+            user_id="user-id",
+        )
+
+    assert requested_sizes == [2, 1, 1]
+    assert [item["segment_id"] for item in translated] == ["seg-0001", "seg-0002"]
+
+
+async def test_single_incomplete_segment_has_bounded_retries():
+    segments = translation_service.segment_document("Only one paragraph.")
+    mocked_ai = AsyncMock(
+        side_effect=translation_service.IncompleteTranslationResponseError([], "en")
+    )
+    with (
+        patch.object(translation_service, "call_deepseek_translation", mocked_ai),
+        pytest.raises(translation_service.IncompleteTranslationResponseError),
+    ):
+        await translation_service.translate_batch_with_recovery(
+            segments,
+            source_language="auto",
+            target_language="zh-CN",
+            style="general",
+            glossary=[],
+            user_id="user-id",
+        )
+
+    assert mocked_ai.await_count == translation_service.SINGLE_SEGMENT_RETRIES + 1

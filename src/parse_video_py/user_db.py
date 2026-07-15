@@ -219,3 +219,21 @@ def get_or_create_user(openid: str, unionid: str | None = None) -> SystemUser:
             # Retry and resolve the winner through the unique indexes.
             continue
     raise RuntimeError("unable to create a unique user after concurrent retries")
+
+
+def get_wechat_openid_for_user(user_id: str) -> str:
+    """Resolve a system user to its bound WeChat mini-program OpenID."""
+    user_id = (user_id or "").strip()
+    if not user_id:
+        raise ValueError("user_id cannot be empty")
+    init_user_database()
+    with _engine.connect() as conn:
+        openid = conn.execute(
+            select(user_identities.c.provider_user_id).where(
+                user_identities.c.user_id == user_id,
+                user_identities.c.provider == "wechat_miniprogram",
+            ).limit(1)
+        ).scalar_one_or_none()
+    if not openid:
+        raise ValueError("user has no bound WeChat mini-program identity")
+    return str(openid)
