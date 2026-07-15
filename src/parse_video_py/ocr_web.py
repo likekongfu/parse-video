@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
+import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import fitz
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
-from starlette.concurrency import run_in_threadpool
-
 from parse_video_py.ocr_service import OcrUnavailableError, recognize_images
 from parse_video_py.qr_auth import verify_web_session
 
@@ -17,7 +21,21 @@ router = APIRouter(prefix="/auth/ocr", tags=["ocr"])
 MAX_UPLOAD_BYTES = int(os.getenv("OCR_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 MAX_PDF_PAGES = int(os.getenv("OCR_MAX_PDF_PAGES", "20"))
 PDF_RENDER_SCALE = float(os.getenv("OCR_PDF_RENDER_SCALE", "2.0"))
+TASK_TTL_SECONDS = int(os.getenv("OCR_TASK_TTL_SECONDS", "7200"))
+TASK_WORKERS = max(1, int(os.getenv("OCR_TASK_WORKERS", "1")))
+MAX_PENDING_TASKS = max(1, int(os.getenv("OCR_MAX_PENDING_TASKS", "20")))
+TASK_ROOT = Path(
+    os.getenv(
+        "OCR_TASK_DIR",
+        str(Path(tempfile.gettempdir()) / "parse-video-py-ocr-tasks"),
+    )
+)
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".pdf"}
+_tasks: dict[str, dict[str, Any]] = {}
+_tasks_lock = threading.Lock()
+_executor = ThreadPoolExecutor(
+    max_workers=TASK_WORKERS, thread_name_prefix="paddle-ocr"
+)
 
 
 def _current_user(request: Request):
@@ -84,26 +102,12 @@ def _prepare_pages(source: Path, extension: str, directory: Path) -> list[Path]:
         document.close()
 
 
-@router.post("")
-async def recognize_file(request: Request, file: UploadFile = File(...)):
-    _current_user(request)
-    filename = (file.filename or "").strip()
-    extension = Path(filename).suffix.lower()
-    if extension not in ALLOWED_EXTENSIONS:
-        await file.close()
-        raise HTTPException(status_code=400, detail="仅支持 JPG、PNG、PDF 文件")
-    with tempfile.TemporaryDirectory(prefix="paddle-ocr-") as temporary:
-        directory = Path(temporary)
-        source = directory / f"source{extension}"
-        size = await _save_upload(file, source)
-        _validate_signature(source, extension)
-        pages = await run_in_threadpool(_prepare_pages, source, extension, directory)
-        try:
-            results = await run_in_threadpool(recognize_images, pages)
-        except OcrUnavailableError as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-        except RuntimeError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
+def _result_payload(
+    filename: str,
+    size: int,
+    extension: str,
+    results: list[dict[str, Any]],
+) -> dict[str, Any]:
     lines = [line for page in results for line in page["lines"]]
     confidences = [
         line["confidence"] for line in lines if line["confidence"] is not None
@@ -121,3 +125,112 @@ async def recognize_file(request: Request, file: UploadFile = File(...)):
         "full_text": "\n\n".join(page["text"] for page in results if page["text"]),
         "pages": results,
     }
+
+
+def _cleanup_tasks(now: float | None = None) -> None:
+    cutoff = (now or time.time()) - TASK_TTL_SECONDS
+    with _tasks_lock:
+        stale = [
+            job_id
+            for job_id, task in _tasks.items()
+            if task["status"] != "processing" and task["updated_at"] < cutoff
+        ]
+        for job_id in stale:
+            _tasks.pop(job_id, None)
+
+
+def _update_task(job_id: str, **values: Any) -> None:
+    with _tasks_lock:
+        task = _tasks.get(job_id)
+        if task is not None:
+            task.update(values, updated_at=time.time())
+
+
+def _run_ocr_task(
+    job_id: str,
+    directory: Path,
+    source: Path,
+    extension: str,
+    filename: str,
+    size: int,
+) -> None:
+    try:
+        pages = _prepare_pages(source, extension, directory)
+        results = recognize_images(pages)
+        _update_task(
+            job_id,
+            status="completed",
+            result=_result_payload(filename, size, extension, results),
+        )
+    except OcrUnavailableError as exc:
+        _update_task(job_id, status="failed", error=str(exc))
+    except HTTPException as exc:
+        _update_task(job_id, status="failed", error=str(exc.detail))
+    except Exception as exc:
+        _update_task(
+            job_id,
+            status="failed",
+            error=f"OCR 识别失败：{type(exc).__name__}: {exc}",
+        )
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+@router.post("", status_code=202)
+async def recognize_file(request: Request, file: UploadFile = File(...)):
+    user = _current_user(request)
+    _cleanup_tasks()
+    filename = (file.filename or "").strip()
+    extension = Path(filename).suffix.lower()
+    if extension not in ALLOWED_EXTENSIONS:
+        await file.close()
+        raise HTTPException(status_code=400, detail="仅支持 JPG、PNG、PDF 文件")
+    with _tasks_lock:
+        pending = sum(task["status"] == "processing" for task in _tasks.values())
+    if pending >= MAX_PENDING_TASKS:
+        await file.close()
+        raise HTTPException(status_code=429, detail="OCR 任务较多，请稍后重试")
+
+    TASK_ROOT.mkdir(parents=True, exist_ok=True)
+    job_id = uuid.uuid4().hex
+    directory = Path(tempfile.mkdtemp(prefix=f"{job_id}-", dir=TASK_ROOT))
+    source = directory / f"source{extension}"
+    try:
+        size = await _save_upload(file, source)
+        _validate_signature(source, extension)
+    except Exception:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+
+    now = time.time()
+    with _tasks_lock:
+        _tasks[job_id] = {
+            "job_id": job_id,
+            "user_id": str(user.id),
+            "status": "processing",
+            "filename": filename,
+            "created_at": now,
+            "updated_at": now,
+            "result": None,
+            "error": None,
+        }
+    _executor.submit(
+        _run_ocr_task, job_id, directory, source, extension, filename, size
+    )
+    return {"job_id": job_id, "status": "processing"}
+
+
+@router.get("/status/{job_id}")
+def recognize_status(request: Request, job_id: str):
+    user = _current_user(request)
+    _cleanup_tasks()
+    with _tasks_lock:
+        task = _tasks.get(job_id)
+        if task is None or task["user_id"] != str(user.id):
+            raise HTTPException(status_code=404, detail="OCR 任务不存在或已过期")
+        status = task["status"]
+        if status == "completed":
+            return {"job_id": job_id, "status": status, "result": task["result"]}
+        if status == "failed":
+            return {"job_id": job_id, "status": status, "error": task["error"]}
+        return {"job_id": job_id, "status": status}
