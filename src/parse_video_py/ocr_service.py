@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -9,6 +10,13 @@ from typing import Any
 import logging
 
 logger = logging.getLogger(__name__)
+
+DETECTION_MODEL_NAME = os.getenv(
+    "OCR_DETECTION_MODEL_NAME", "PP-OCRv5_mobile_det"
+).strip()
+RECOGNITION_MODEL_NAME = os.getenv(
+    "OCR_RECOGNITION_MODEL_NAME", "PP-OCRv5_mobile_rec"
+).strip()
 
 
 class OcrUnavailableError(RuntimeError):
@@ -30,6 +38,8 @@ def _get_engine():
             from paddleocr import PaddleOCR
 
             _engine = PaddleOCR(
+                text_detection_model_name=DETECTION_MODEL_NAME,
+                text_recognition_model_name=RECOGNITION_MODEL_NAME,
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
                 use_textline_orientation=False,
