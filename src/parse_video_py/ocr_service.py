@@ -33,6 +33,8 @@ def _get_engine():
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
                 use_textline_orientation=False,
+                enable_mkmdnn=False,
+                cpu_threads=2
             )
         except Exception as exc:
             raise OcrUnavailableError(
