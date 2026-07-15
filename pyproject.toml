@@ -32,6 +32,10 @@ document = [
     "PyMuPDF>=1.24",
     "pikepdf>=9.0",
 ]
+ocr = [
+    "paddlepaddle>=3.3,<4",
+    "paddleocr>=3.7,<4",
+]
 cli = [
     "typer>=0.12",
     "rich>=13.0",
@@ -45,7 +49,7 @@ dev = [
     "flake8>=7.0",
     "pre-commit>=3.7",
 ]
-all = ["parse-video-py[web,document,cli]"]
+all = ["parse-video-py[web,document,ocr,cli]"]
 
 [project.scripts]
 parse-video-py = "parse_video_py.cli:app"

@@ -13,6 +13,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     MEDIA_CONVERTER_TOKEN="" \
     MEDIA_WATERMARK_TIMEOUT_SECONDS=300 \
     MEDIA_WATERMARK_FONT_FILE=/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc \
+    OCR_MAX_UPLOAD_BYTES=20971520 \
+    OCR_MAX_PDF_PAGES=20 \
+    OCR_PDF_RENDER_SCALE=2.0 \
     FFMPEG_BIN=ffmpeg \
     FFPROBE_BIN=ffprobe
 
@@ -22,13 +25,15 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg \
         fonts-noto-cjk \
+        libglib2.0-0 \
+        libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md ./
 COPY src/ ./src/
 
 RUN python -m pip install --upgrade pip \
-    && python -m pip install ".[web]" \
+    && python -m pip install ".[web,ocr]" \
     && useradd --create-home --shell /usr/sbin/nologin appuser \
     && mkdir -p data/media-upload data/media-output \
     && chown -R appuser:appuser /app

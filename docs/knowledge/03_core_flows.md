@@ -135,6 +135,15 @@ confidence: high
 5. `GET /auth/processing-history` 只返回当前用户的记录，按创建时间倒序排列并限制最多 100 条。
 6. AI 总结、翻译及各类文件工具在处理成功后写入统一历史，首页最近使用和历史中心统一读取新接口；原有总结“保存历史”接口继续兼容摘要详情。
 
+### PaddleOCR 文字识别
+
+1. 已登录网页通过 `POST /auth/ocr` 上传 JPG、PNG 或 PDF，默认限制 20MB，PDF 最多 20 页。
+2. 服务校验文件扩展名与文件头；PDF 使用 PyMuPDF 按配置倍率逐页渲染为 PNG，加密或空 PDF 会被拒绝。
+3. `ocr_service.py` 在第一次请求时懒加载 PaddleOCR 3.x，容器健康检查不会触发模型下载。
+4. 推理放在线程池中执行，并使用进程内锁串行访问 Paddle predictor，避免阻塞事件循环或并发访问非线程安全推理器。
+5. PaddleOCR 3.x 的 `rec_texts`、`rec_scores`、`rec_boxes/rec_polys` 被归一化为分页文本、行级置信度和坐标；同时兼容旧版嵌套行结果。
+6. 前端提供图片预览、识别进度、分页结果、全文复制和 TXT 导出，成功后写入统一文件处理历史。
+
 ---
 
 ## 流程：视频 ID 解析

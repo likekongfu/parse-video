@@ -31,6 +31,7 @@ from parse_video_py.auth_web import router as auth_router
 from parse_video_py.document_summary_web import router as document_summary_router
 from parse_video_py.document_translation_web import router as document_translation_router
 from parse_video_py.processing_history_web import router as processing_history_router
+from parse_video_py.ocr_web import router as ocr_router
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +119,7 @@ app.include_router(auth_router)
 app.include_router(document_summary_router)
 app.include_router(document_translation_router)
 app.include_router(processing_history_router)
+app.include_router(ocr_router)
 
 
 # ---------------------------------------------------------------------------

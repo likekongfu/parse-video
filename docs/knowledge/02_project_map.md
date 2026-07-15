@@ -89,6 +89,8 @@ confidence: high
 - `document_translation_web.py`：登录用户翻译与 DOCX/TXT 导出路由。
 - `processing_history.py`：统一保存 PDF、文档、图片、视频处理记录与限量查询。
 - `processing_history_web.py`：基于网页 Cookie 会话的统一处理历史写入和查询接口。
+- `ocr_service.py`：PaddleOCR 3.x 懒加载、串行推理与结果归一化。
+- `ocr_web.py`：登录用户 JPG/PNG/PDF 上传、PDF 逐页渲染和 OCR 接口。
 - `migrations/20260713_unified_users.sql`：MySQL 建表迁移。
 - `migrations/20260713_document_summary.sql`：`documents` 与 `document_tasks` 建表迁移。
 - `migrations/20260713_document_summary_types.sql`：已建库环境增加文档类型与类型来源字段。
@@ -109,6 +111,7 @@ confidence: high
 | GET | `/auth/documents/history` | 查询用户保存记录 | `document_summary_web.py` | `document_summary_web.py` |
 | POST | `/auth/processing-history` | 写入当前登录用户的文件处理记录 | `processing_history_web.py` | `processing_history_web.py` |
 | GET | `/auth/processing-history` | 查询当前登录用户的统一处理历史 | `processing_history_web.py` | `processing_history_web.py` |
+| POST | `/auth/ocr` | 使用 PaddleOCR 识别 JPG、PNG 或扫描版 PDF | `ocr_web.py` | `ocr_web.py` |
 | POST | `/auth/documents/{id}/translate` | 按语言、模式、风格和术语表翻译 | `document_translation_web.py` | `document_translation_web.py` |
 | GET | `/auth/documents/{id}/translations/{translation_id}/export` | 导出 DOCX/TXT | `document_translation_web.py` | `document_translation_web.py` |
 

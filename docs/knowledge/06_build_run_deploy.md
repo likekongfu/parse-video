@@ -31,6 +31,9 @@ source_commit: dd55df3
 | `DEEPSEEK_MAX_INPUT_CHARS` | 单次总结最大输入字符数；超出时取开头和结尾并返回 source_truncated | 否 | `100000` | `document_summary.py` | `document_summary.py` |
 | `DOCUMENT_SUMMARY_UPLOAD_DIR` | 总结文档持久化目录 | 否 | `data/document-summary` | `document_summary_web.py` | `document_summary_web.py` |
 | `DOCUMENT_TRANSLATION_BATCH_CHARS` | 单次翻译批次最大字符数，只在段落边界分批；响应漏段时仅重试缺失段落，并在异常响应时自动拆分批次 | 否 | `6000` | `document_translation.py` | `document_translation.py` |
+| `OCR_MAX_UPLOAD_BYTES` | OCR 单文件最大上传字节数 | 否 | `20971520` | `ocr_web.py` | `ocr_web.py` |
+| `OCR_MAX_PDF_PAGES` | OCR PDF 最大页数 | 否 | `20` | `ocr_web.py` | `ocr_web.py` |
+| `OCR_PDF_RENDER_SCALE` | PDF 页面转图片倍率，越高越清晰但内存和耗时越大 | 否 | `2.0` | `ocr_web.py` | `ocr_web.py` |
 
 ## 安装依赖
 
@@ -134,6 +137,8 @@ mysql -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$MYSQL_USER" -p "$MYSQL_DATABASE" \
 ```
 
 媒体容器需要继续挂载 `/app/data`，以持久化 `DOCUMENT_SUMMARY_UPLOAD_DIR` 下的上传文件。
+
+媒体镜像通过 `.[web,ocr]` 安装 CPU 版 PaddlePaddle 与 PaddleOCR。OCR 模型在第一次识别请求时下载到容器用户缓存；生产环境应持久化对应模型缓存或在镜像构建阶段预热，避免容器重建后重复下载。首次请求时间可能明显长于后续请求。
 
 ## 常见问题
 
