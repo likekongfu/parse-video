@@ -162,7 +162,8 @@ cython_debug/
 .vscode/
 
 # test files
-test.py
+test_*.py
+/tests
 
 # uv
 uv.lock

@@ -128,6 +128,25 @@ document_translations = Table(
     Index("ix_document_translations_user_created", "user_id", "created_at"),
 )
 
+file_processing_history = Table(
+    "file_processing_history", _metadata,
+    Column("id", String(36), primary_key=True),
+    Column("user_id", String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
+    Column("source_filename", String(255), nullable=False),
+    Column("source_file_size", BigInteger, nullable=False),
+    Column("category", String(20), nullable=False),
+    Column("tool_type", String(64), nullable=False),
+    Column("tool_label", String(120), nullable=False),
+    Column("status", String(20), nullable=False),
+    Column("output_filename", String(255), nullable=True),
+    Column("output_url", String(2048), nullable=True),
+    Column("output_expires_at", BigInteger, nullable=True),
+    Column("error_message", String(1000), nullable=True),
+    Column("created_at", BigInteger, nullable=False),
+    Column("completed_at", BigInteger, nullable=True),
+    Index("ix_file_processing_history_user_created", "user_id", "created_at"),
+)
+
 
 @dataclass(frozen=True)
 class SystemUser:

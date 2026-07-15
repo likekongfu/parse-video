@@ -87,6 +87,8 @@ confidence: high
 - `document_summary_web.py`：登录用户文档上传、解析、总结和历史路由。
 - `document_translation.py`：按标题/段落分块调用 DeepSeek，并缓存翻译和导出结果。
 - `document_translation_web.py`：登录用户翻译与 DOCX/TXT 导出路由。
+- `processing_history.py`：统一保存 PDF、文档、图片、视频处理记录与限量查询。
+- `processing_history_web.py`：基于网页 Cookie 会话的统一处理历史写入和查询接口。
 - `migrations/20260713_unified_users.sql`：MySQL 建表迁移。
 - `migrations/20260713_document_summary.sql`：`documents` 与 `document_tasks` 建表迁移。
 - `migrations/20260713_document_summary_types.sql`：已建库环境增加文档类型与类型来源字段。
@@ -105,6 +107,8 @@ confidence: high
 | POST | `/auth/documents/{id}/summarize` | DeepSeek 自动分类与动态结构化总结；可选 document_type/regenerate 手动重生成 | `document_summary_web.py` | `document_summary_web.py` |
 | POST | `/auth/documents/{id}/save` | 保存到用户历史 | `document_summary_web.py` | `document_summary_web.py` |
 | GET | `/auth/documents/history` | 查询用户保存记录 | `document_summary_web.py` | `document_summary_web.py` |
+| POST | `/auth/processing-history` | 写入当前登录用户的文件处理记录 | `processing_history_web.py` | `processing_history_web.py` |
+| GET | `/auth/processing-history` | 查询当前登录用户的统一处理历史 | `processing_history_web.py` | `processing_history_web.py` |
 | POST | `/auth/documents/{id}/translate` | 按语言、模式、风格和术语表翻译 | `document_translation_web.py` | `document_translation_web.py` |
 | GET | `/auth/documents/{id}/translations/{translation_id}/export` | 导出 DOCX/TXT | `document_translation_web.py` | `document_translation_web.py` |
 
