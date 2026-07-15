@@ -34,7 +34,7 @@ def _get_engine():
                 use_doc_unwarping=False,
                 use_textline_orientation=False,
                 enable_mkldnn=False,
-                cpu_threads=2
+                cpu_threads=2,
             )
         except Exception as exc:
             raise OcrUnavailableError(
@@ -52,6 +52,16 @@ def recognize_images(paths: list[Path]) -> list[dict[str, Any]]:
         for page_number, path in enumerate(paths, start=1):
             try:
                 results = engine.predict(str(path))
+                lines: list[dict[str, Any]] = []
+                for result in results or []:
+                    lines.extend(_normalize_result(result))
+                pages.append(
+                    {
+                        "page_number": page_number,
+                        "text": "\n".join(line["text"] for line in lines),
+                        "lines": lines,
+                    }
+                )
             except Exception as exc:
                 logger.exception(
                     "第 %s 页 OCR 识别失败，图片路径：%s",
@@ -61,16 +71,6 @@ def recognize_images(paths: list[Path]) -> list[dict[str, Any]]:
                 raise RuntimeError(
                     f"第 {page_number} 页 OCR 识别失败：" f"{type(exc).__name__}: {exc}"
                 ) from exc
-            lines: list[dict[str, Any]] = []
-            for result in results or []:
-                lines.extend(_normalize_result(result))
-            pages.append(
-                {
-                    "page_number": page_number,
-                    "text": "\n".join(line["text"] for line in lines),
-                    "lines": lines,
-                }
-            )
     return pages
 
 
