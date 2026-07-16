@@ -21,3 +21,12 @@ htmlcov/
 tests/
 docs/
 resources/
+
+# Local secrets and deployment-only files
+.env
+.env.*
+env/
+data/
+compose*.yml
+scripts/
+project-tree.txt

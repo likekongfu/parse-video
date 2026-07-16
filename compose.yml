@@ -1,0 +1,94 @@
+name: parse-video-py
+
+services:
+  longtian-mysql:
+    image: mysql:8.0
+    pull_policy: never
+    container_name: longtian-mysql
+    restart: unless-stopped
+    stop_grace_period: 1m
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    env_file:
+      - ./env/longtian-mysql.env
+    volumes:
+      - /opt/longtian-mysql-data:/var/lib/mysql
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mysqladmin ping -h 127.0.0.1 -uroot --password=\"$$MYSQL_ROOT_PASSWORD\" --silent"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - longtian_internal
+
+  parse-video-py:
+    image: parse-video-py:latest
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: parse-video-py
+    restart: unless-stopped
+    depends_on:
+      longtian-mysql:
+        condition: service_healthy
+    env_file:
+      - ./env/parse-video.env
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - /opt/parse-video-data:/app/data
+    networks:
+      - longtian_gateway
+      - longtian_internal
+
+  document-converter-word2pdf:
+    image: document-converter-word2pdf:latest
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: Dockerfile.document-converter
+    container_name: document-converter-word2pdf
+    restart: unless-stopped
+    env_file:
+      - ./env/document-converter.env
+    ports:
+      - "127.0.0.1:8010:8010"
+    networks:
+      - longtian_gateway
+
+  media-converter:
+    image: media-converter:latest
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: Dockerfile.media-converter
+    container_name: media-converter
+    restart: unless-stopped
+    depends_on:
+      longtian-mysql:
+        condition: service_healthy
+    env_file:
+      - ./env/media-converter.env
+    ports:
+      - "127.0.0.1:8020:8020"
+    volumes:
+      - /opt/media-converter-data:/app/data
+    networks:
+      - longtian_gateway
+      - longtian_internal
+
+networks:
+  longtian_gateway:
+    external: true
+    name: longtian_gateway
+
+  longtian_internal:
+    external: true
+    name: longtian_internal
