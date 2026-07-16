@@ -473,6 +473,27 @@ def current_user(request: Request):
     }}
 
 
+@router.post("/token")
+def refresh_openid_token(request: Request):
+    """Issue a fresh short-lived openidToken for a valid web session."""
+    session_token = request.cookies.get("web_session", "")
+    if not session_token:
+        raise HTTPException(status_code=401, detail="未登录")
+    try:
+        user = verify_web_session(session_token)
+        openid = get_wechat_openid_for_user(user.id)
+        openid_token = create_openid_token(openid)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except WxSecurityConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {
+        "status": "ok",
+        "openidToken": openid_token,
+        "expiresIn": OPENID_TOKEN_TTL,
+    }
+
+
 @router.post("/logout", status_code=204)
 def logout(response: Response):
     response.delete_cookie(

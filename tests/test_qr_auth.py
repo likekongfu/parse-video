@@ -154,10 +154,22 @@ def test_qr_routes_keep_expected_contract():
         assert second_refresh.status_code == 200
         assert second_refresh.json()["user"]["internal_code"] == "ABC123"
 
+    with patch.object(auth_web, "verify_web_session", return_value=user), \
+         patch.object(auth_web, "get_wechat_openid_for_user", return_value="openid"), \
+         patch.object(auth_web, "create_openid_token", return_value="refreshed-openid-token"):
+        refreshed = client.post("/auth/token")
+        assert refreshed.status_code == 200
+        assert refreshed.json() == {
+            "status": "ok",
+            "openidToken": "refreshed-openid-token",
+            "expiresIn": auth_web.OPENID_TOKEN_TTL,
+        }
+
     response = client.post("/auth/logout")
     assert response.status_code == 204
     assert "Max-Age=0" in response.headers["set-cookie"]
     assert client.get("/auth/me").status_code == 401
+    assert client.post("/auth/token").status_code == 401
 
 
 def test_qr_actions_reject_missing_or_expired_miniprogram_token():
