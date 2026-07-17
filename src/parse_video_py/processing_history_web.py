@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException, Request
@@ -9,6 +10,7 @@ from pydantic import BaseModel
 
 from parse_video_py.processing_history import (
     create_processing_history,
+    delete_processing_history,
     list_processing_history,
 )
 from parse_video_py.qr_auth import verify_web_session
@@ -99,3 +101,15 @@ def add_processing_history(request: Request, payload: ProcessingHistoryRequest):
 def get_processing_history(request: Request, limit: int = 30):
     user = _current_user(request)
     return {"history": list_processing_history(user.id, min(max(limit, 1), 100))}
+
+
+@router.delete("/{history_id}")
+def remove_processing_history(request: Request, history_id: str):
+    user = _current_user(request)
+    try:
+        normalized_id = str(uuid.UUID(history_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="历史记录编号无效") from exc
+    if not delete_processing_history(user.id, normalized_id):
+        raise HTTPException(status_code=404, detail="历史记录不存在")
+    return {"deleted": True, "id": normalized_id}

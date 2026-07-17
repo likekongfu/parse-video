@@ -6,7 +6,7 @@ import time
 import uuid
 from typing import Any
 
-from sqlalchemy import insert, select
+from sqlalchemy import delete, insert, select
 
 from parse_video_py import user_db
 
@@ -62,6 +62,19 @@ def list_processing_history(user_id: str, limit: int = 30) -> list[dict[str, Any
             .all()
         )
     return [_public_record(dict(row)) for row in rows]
+
+
+def delete_processing_history(user_id: str, history_id: str) -> bool:
+    """Delete one history record owned by the authenticated user."""
+    user_db.init_user_database()
+    with user_db._engine.begin() as conn:
+        result = conn.execute(
+            delete(user_db.file_processing_history).where(
+                user_db.file_processing_history.c.id == history_id,
+                user_db.file_processing_history.c.user_id == user_id,
+            )
+        )
+    return result.rowcount > 0
 
 
 def _public_record(record: dict[str, Any]) -> dict[str, Any]:
