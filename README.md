@@ -256,7 +256,7 @@ DEEPSEEK_API_URL=https://api.deepseek.com/chat/completions
 DEEPSEEK_TIMEOUT_SECONDS=120
 DEEPSEEK_MAX_INPUT_CHARS=100000
 TRANSLATION_BATCH_SIZE=20
-PDF_TRANSLATION_MIN_SCALE=0.50
+PDF_TRANSLATION_MIN_SCALE=0.35
 TRANSLATION_JOB_TIMEOUT_SECONDS=1800
 TRANSLATION_JOB_TTL_SECONDS=7200
 TRANSLATION_JOB_CLEANUP_INTERVAL_SECONDS=60
@@ -298,7 +298,8 @@ DOCX translation export return HTTP `422`. PDF export reuses the uploaded PDF
 pages and replaces text inside the original page/block
 coordinates. Page size, page count, images, vector graphics, and other content
 outside translated text blocks remain in the original PDF. Text is scaled down
-only as far as `PDF_TRANSLATION_MIN_SCALE` (default `0.50`); if a translated block
+only as far as `PDF_TRANSLATION_MIN_SCALE` (default `0.35`, absolute minimum
+`0.25`); if a translated block
 still cannot fit, export fails explicitly instead of truncating it. Scanned PDFs,
 encrypted PDFs, and original-layout bilingual PDF translation are not supported.
 

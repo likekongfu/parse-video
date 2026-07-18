@@ -226,6 +226,59 @@ def _styled_pdf_bytes() -> bytes:
     return payload
 
 
+class _FakePdfLayoutPage:
+    def __init__(self, fitter, *, images=None, drawings=None):
+        self.rect = fitz.Rect(0, 0, 300, 300)
+        self._fitter = fitter
+        self._images = images or []
+        self._drawings = drawings or []
+        self.calls = []
+
+    def get_image_info(self, **_kwargs):
+        return self._images
+
+    def get_drawings(self):
+        return self._drawings
+
+    def insert_htmlbox(self, rect, content, *, css, scale_low, overlay):
+        rect = fitz.Rect(rect)
+        self.calls.append(
+            {
+                "rect": rect,
+                "content": content,
+                "css": css,
+                "scale_low": scale_low,
+                "overlay": overlay,
+            }
+        )
+        return self._fitter(rect, scale_low)
+
+
+def _pdf_layout_segment(
+    *,
+    segment_id="p0001-b0001",
+    source_text="原文",
+    translated_text="Translated text",
+    bbox=(40, 40, 200, 70),
+    kind="paragraph",
+):
+    return {
+        "segment_id": segment_id,
+        "source_text": source_text,
+        "translated_text": translated_text,
+        "kind": kind,
+        "layout": {
+            "page_number": 1,
+            "block_index": 1,
+            "bbox": list(bbox),
+            "font_size": 12,
+            "font_color": "#000000",
+            "font_family": "sans-serif",
+            "text_align": "left",
+        },
+    }
+
+
 def _translated_batch(segments, **_kwargs):
     return "en", [
         {
@@ -445,6 +498,10 @@ def test_pdf_translation_export_preserves_original_page_layout(monkeypatch, tmp_
     source_bytes = _styled_pdf_bytes()
     with patch.object(summary_web, "verify_web_session", return_value=user):
         document_id = _upload_bytes_and_parse(client, source_bytes, "agreement.pdf")
+    stored_pdf = Path(
+        translation_service.get_owned_document(user.id, document_id)["storage_path"]
+    )
+    stored_source_before_export = stored_pdf.read_bytes()
 
     async def translated_pdf_batch(segments, **_kwargs):
         translations = ["服务协议", "总金额为 1,200 美元"]
@@ -528,6 +585,129 @@ def test_pdf_translation_export_preserves_original_page_layout(monkeypatch, tmp_
         )
     assert failed_export.status_code == 502
     assert failed_export.json()["detail"] == "PDF版式写入失败：测试错误"
+    assert stored_pdf.read_bytes() == stored_source_before_export
+
+
+def test_pdf_physical_line_breaks_are_reflowed_as_natural_paragraphs():
+    translated = (
+        "This line was wrapped by PDF geometry\n"
+        "but belongs to the same paragraph.\n\n"
+        "This is an explicit second paragraph."
+    )
+    normalized = translation_service._normalize_pdf_translated_text(
+        translated, "paragraph"
+    )
+    assert normalized == (
+        "This line was wrapped by PDF geometry but belongs to the same paragraph."
+        "\n\nThis is an explicit second paragraph."
+    )
+    assert translation_service._pdf_translation_html(normalized).count("<br>") == 2
+    assert (
+        translation_service._normalize_pdf_translated_text(
+            "A title\nwrapped physically", "heading"
+        )
+        == "A title wrapped physically"
+    )
+
+
+def test_pdf_long_chinese_to_english_translation_scales_to_point_35(monkeypatch):
+    source_text = (
+        "这是一段用于验证PDF长文本翻译布局、自动缩放、区域扩展、"
+        "页面边界以及障碍物避让的中文内容。"
+    )
+    translated_text = (
+        "This is an English translation used to verify long PDF text layout, "
+        "automatic scaling, and safe region expansion."
+    )
+    assert 2 <= len(translated_text) / len(source_text) <= 3
+    segment = _pdf_layout_segment(
+        source_text=source_text,
+        translated_text=translated_text,
+    )
+    page = _FakePdfLayoutPage(
+        lambda _rect, scale_low: ((0, 0.35) if scale_low <= 0.35 else (-1, scale_low))
+    )
+    monkeypatch.setattr(translation_service, "PDF_TRANSLATION_MIN_SCALE", 0.35)
+
+    plan = translation_service._fit_pdf_layout_block(page, segment, [segment])
+
+    assert [call["scale_low"] for call in page.calls] == [1.0, 0.35]
+    assert plan["scale_low"] == 0.35
+    assert plan["fitted_scale"] == 0.35
+    assert "\n" not in plan["normalized_text"]
+
+
+def test_pdf_layout_expands_bbox_down_before_horizontal(monkeypatch):
+    segment = _pdf_layout_segment(
+        translated_text="A translated paragraph that needs additional vertical space."
+    )
+    page = _FakePdfLayoutPage(
+        lambda rect, _scale: ((0, 0.35) if rect.y1 > 70 else (-1, 1.0))
+    )
+    monkeypatch.setattr(translation_service, "PDF_TRANSLATION_MIN_SCALE", 0.35)
+
+    plan = translation_service._fit_pdf_layout_block(page, segment, [segment])
+
+    assert plan["bbox"][3] > segment["layout"]["bbox"][3]
+    assert page.calls[2]["rect"].y1 > page.calls[1]["rect"].y1
+
+
+def test_pdf_layout_expansion_stops_before_text_image_and_graphics(monkeypatch):
+    segment = _pdf_layout_segment()
+    next_segment = _pdf_layout_segment(
+        segment_id="p0001-b0002",
+        bbox=(40, 120, 200, 145),
+    )
+    page = _FakePdfLayoutPage(
+        lambda _rect, _scale: (-1, 1.0),
+        images=[{"bbox": (40, 105, 200, 115)}],
+        drawings=[
+            {
+                "width": 1,
+                "items": [("l", fitz.Point(20, 95), fitz.Point(250, 95))],
+            }
+        ],
+    )
+    monkeypatch.setattr(translation_service, "PDF_TRANSLATION_MIN_SCALE", 0.35)
+
+    attempts = translation_service._pdf_layout_attempts(
+        page, segment, [segment, next_segment]
+    )
+    expanded_rects = [
+        rect for stage, rect, _ in attempts if stage.startswith("expanded")
+    ]
+
+    assert expanded_rects
+    assert all(rect.y1 <= 92.5 for rect in expanded_rects)
+    assert all(
+        rect.x0 >= page.rect.x0 and rect.x1 <= page.rect.x1 for rect in expanded_rects
+    )
+
+
+def test_pdf_layout_overflow_has_structured_422(monkeypatch):
+    segment = _pdf_layout_segment(
+        translated_text="This translation can never fit in the available PDF area."
+    )
+    page = _FakePdfLayoutPage(lambda _rect, _scale: (-1, 1.0))
+    monkeypatch.setattr(translation_service, "PDF_TRANSLATION_MIN_SCALE", 0.35)
+
+    with pytest.raises(translation_service.PDFLayoutOverflowError) as error_info:
+        translation_service._fit_pdf_layout_block(page, segment, [segment])
+
+    error = error_info.value
+    assert error.error_code == "PDF_LAYOUT_OVERFLOW"
+    assert error.page_number == 1
+    assert error.segment_id == "p0001-b0001"
+    assert error.original_bbox == [40.0, 40.0, 200.0, 70.0]
+    assert error.attempted_scale == 0.25
+    assert error.translated_length == len(segment["translated_text"])
+    assert 0.25 in [call["scale_low"] for call in page.calls]
+
+    response_error = translation_web._service_error(error)
+    assert response_error.status_code == 422
+    assert response_error.detail["error_code"] == "PDF_LAYOUT_OVERFLOW"
+    assert response_error.detail["page_number"] == 1
+    assert response_error.detail["attempted_bbox"] == error.attempted_bbox
 
 
 def test_original_layout_pdf_export_rejects_bilingual_mode(monkeypatch, tmp_path):

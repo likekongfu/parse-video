@@ -43,8 +43,11 @@ TRANSLATION_JOB_CLEANUP_INTERVAL_SECONDS = max(
     10, int(os.getenv("TRANSLATION_JOB_CLEANUP_INTERVAL_SECONDS", "60"))
 )
 PDF_TRANSLATION_MIN_SCALE = min(
-    1.0, max(0.25, float(os.getenv("PDF_TRANSLATION_MIN_SCALE", "0.50")))
+    1.0, max(0.25, float(os.getenv("PDF_TRANSLATION_MIN_SCALE", "0.35")))
 )
+PDF_TRANSLATION_ABSOLUTE_MIN_SCALE = 0.25
+PDF_LAYOUT_GAP = 2.0
+PDF_LAYOUT_HORIZONTAL_EXPANSION = 18.0
 DEEPSEEK_API_URL = os.getenv(
     "DEEPSEEK_API_URL", "https://api.deepseek.com/chat/completions"
 ).strip()
@@ -75,6 +78,46 @@ class DocumentTranslationBusyError(DocumentTranslationError):
 
 class InvalidTranslationRequestError(DocumentTranslationError):
     """The requested mode or export format is incompatible with the source file."""
+
+
+class PDFLayoutOverflowError(DocumentTranslationError):
+    """Translated text cannot fit safely inside the original PDF layout."""
+
+    error_code = "PDF_LAYOUT_OVERFLOW"
+
+    def __init__(
+        self,
+        *,
+        page_number: int,
+        segment_id: str,
+        original_bbox: list[float] | tuple[float, ...],
+        attempted_bbox: list[float] | tuple[float, ...],
+        attempted_scale: float,
+        translated_length: int,
+    ) -> None:
+        self.page_number = page_number
+        self.segment_id = segment_id
+        self.original_bbox = [round(float(value), 3) for value in original_bbox]
+        self.attempted_bbox = [round(float(value), 3) for value in attempted_bbox]
+        self.attempted_scale = round(float(attempted_scale), 3)
+        self.translated_length = translated_length
+        super().__init__(
+            "译文过长，无法完整放入原版式区域 "
+            f"(error_code={self.error_code}, page_number={page_number}, "
+            f"segment_id={segment_id})"
+        )
+
+    def to_detail(self) -> dict[str, Any]:
+        return {
+            "error_code": self.error_code,
+            "message": "译文过长，无法完整放入原版式区域",
+            "page_number": self.page_number,
+            "segment_id": self.segment_id,
+            "original_bbox": self.original_bbox,
+            "attempted_bbox": self.attempted_bbox,
+            "attempted_scale": self.attempted_scale,
+            "translated_length": self.translated_length,
+        }
 
 
 class InvalidTranslationResponseError(DocumentTranslationError):
@@ -1761,41 +1804,313 @@ def _apply_pdf_text_redactions(pdf_document, segments: list[dict[str, Any]]) -> 
             page.apply_redactions(**redaction_options)
 
 
-def _insert_pdf_translations(pdf_document, segments: list[dict[str, Any]]) -> None:
+def _normalize_pdf_translated_text(text: str, kind: str) -> str:
+    """Remove physical PDF line wraps while retaining explicit paragraph breaks."""
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if kind == "heading":
+        return re.sub(r"\s+", " ", normalized).strip()
+    paragraphs = re.split(r"\n[ \t]*\n+", normalized)
+    normalized_paragraphs = [
+        re.sub(r"\s+", " ", paragraph).strip() for paragraph in paragraphs
+    ]
+    return "\n\n".join(paragraph for paragraph in normalized_paragraphs if paragraph)
+
+
+def _pdf_translation_html(normalized_text: str) -> str:
+    paragraphs = [html.escape(part) for part in normalized_text.split("\n\n")]
+    return f"<div>{'<br><br>'.join(paragraphs)}</div>"
+
+
+def _pdf_translation_css(layout: dict[str, Any]) -> str:
+    font_size = max(4.0, float(layout.get("font_size") or 10.0))
+    font_color = str(layout.get("font_color") or "#000000")
+    font_family = str(layout.get("font_family") or "sans-serif")
+    text_align = str(layout.get("text_align") or "left")
+    return (
+        "* { margin: 0; padding: 0; } "
+        f"body {{ font-family: {font_family}; font-size: {font_size:.2f}pt; "
+        f"line-height: 1.08; color: {font_color}; text-align: {text_align}; }}"
+    )
+
+
+def _pdf_rect_values(rect) -> list[float]:
+    return [round(float(value), 3) for value in (rect.x0, rect.y0, rect.x1, rect.y1)]
+
+
+def _pdf_inflate_rect(rect, amount: float):
     import fitz
 
+    return fitz.Rect(
+        rect.x0 - amount,
+        rect.y0 - amount,
+        rect.x1 + amount,
+        rect.y1 + amount,
+    )
+
+
+def _pdf_drawing_obstacles(page) -> list[Any]:
+    """Return thin geometry obstacles instead of blocking a drawing's whole bounds."""
+    import fitz
+
+    obstacles: list[Any] = []
+    for drawing in page.get_drawings():
+        stroke = max(0.5, float(drawing.get("width") or 1.0) / 2)
+        for item in drawing.get("items") or []:
+            item_type = item[0]
+            if item_type == "re" and len(item) > 1:
+                rect = fitz.Rect(item[1])
+                obstacles.extend(
+                    [
+                        fitz.Rect(
+                            rect.x0 - stroke,
+                            rect.y0 - stroke,
+                            rect.x1 + stroke,
+                            rect.y0 + stroke,
+                        ),
+                        fitz.Rect(
+                            rect.x0 - stroke,
+                            rect.y1 - stroke,
+                            rect.x1 + stroke,
+                            rect.y1 + stroke,
+                        ),
+                        fitz.Rect(rect.x0 - stroke, rect.y0, rect.x0 + stroke, rect.y1),
+                        fitz.Rect(rect.x1 - stroke, rect.y0, rect.x1 + stroke, rect.y1),
+                    ]
+                )
+                continue
+            points = [
+                value
+                for value in item[1:]
+                if hasattr(value, "x") and hasattr(value, "y")
+            ]
+            if points:
+                x_values = [float(point.x) for point in points]
+                y_values = [float(point.y) for point in points]
+                obstacles.append(
+                    fitz.Rect(
+                        min(x_values) - stroke,
+                        min(y_values) - stroke,
+                        max(x_values) + stroke,
+                        max(y_values) + stroke,
+                    )
+                )
+    return obstacles
+
+
+def _pdf_page_obstacles(
+    page, page_segments: list[dict[str, Any]], current_segment_id: str
+) -> list[Any]:
+    import fitz
+
+    obstacles = [
+        fitz.Rect(segment["layout"]["bbox"])
+        for segment in page_segments
+        if segment["segment_id"] != current_segment_id
+    ]
+    for image in page.get_image_info(xrefs=True):
+        bbox = image.get("bbox")
+        if bbox:
+            obstacles.append(fitz.Rect(bbox))
+    obstacles.extend(_pdf_drawing_obstacles(page))
+    return [rect for rect in obstacles if not rect.is_empty and not rect.is_infinite]
+
+
+def _pdf_rect_has_new_collision(original, candidate, obstacle) -> bool:
+    padded = _pdf_inflate_rect(obstacle, PDF_LAYOUT_GAP)
+    return candidate.intersects(padded) and not original.intersects(padded)
+
+
+def _expand_pdf_bbox_down(page_rect, original, obstacles):
+    import fitz
+
+    bottom = float(page_rect.y1)
+    for obstacle in obstacles:
+        padded = _pdf_inflate_rect(obstacle, PDF_LAYOUT_GAP)
+        horizontally_overlaps = not (
+            padded.x1 <= original.x0 or padded.x0 >= original.x1
+        )
+        if horizontally_overlaps and padded.y0 >= original.y1:
+            bottom = min(bottom, float(padded.y0))
+    bottom = max(float(original.y1), bottom)
+    return fitz.Rect(original.x0, original.y0, original.x1, bottom)
+
+
+def _expand_pdf_bbox_horizontally(page_rect, original, vertically_expanded, obstacles):
+    import fitz
+
+    expansion = min(
+        PDF_LAYOUT_HORIZONTAL_EXPANSION,
+        max(6.0, float(original.width) * 0.12),
+    )
+    left = max(float(page_rect.x0), float(original.x0) - expansion)
+    right = min(float(page_rect.x1), float(original.x1) + expansion)
+    candidate = fitz.Rect(
+        left,
+        original.y0,
+        right,
+        vertically_expanded.y1,
+    )
+    for obstacle in obstacles:
+        if not _pdf_rect_has_new_collision(original, candidate, obstacle):
+            continue
+        padded = _pdf_inflate_rect(obstacle, PDF_LAYOUT_GAP)
+        if padded.x1 <= original.x0:
+            left = max(left, float(padded.x1))
+        elif padded.x0 >= original.x1:
+            right = min(right, float(padded.x0))
+        else:
+            return vertically_expanded
+        candidate = fitz.Rect(left, original.y0, right, vertically_expanded.y1)
+    if right <= left:
+        return vertically_expanded
+    return candidate
+
+
+def _pdf_layout_attempts(page, segment: dict[str, Any], page_segments):
+    import fitz
+
+    original = fitz.Rect(segment["layout"]["bbox"])
+    obstacles = _pdf_page_obstacles(page, page_segments, segment["segment_id"])
+    downward = _expand_pdf_bbox_down(page.rect, original, obstacles)
+    horizontal = _expand_pdf_bbox_horizontally(page.rect, original, downward, obstacles)
+    attempts = [
+        ("original", original, 1.0),
+        ("scaled", original, PDF_TRANSLATION_MIN_SCALE),
+    ]
+    if downward.y1 > original.y1 + 0.01:
+        attempts.append(("expanded_down", downward, PDF_TRANSLATION_MIN_SCALE))
+    if horizontal.x0 < downward.x0 - 0.01 or horizontal.x1 > downward.x1 + 0.01:
+        attempts.append(("expanded_horizontal", horizontal, PDF_TRANSLATION_MIN_SCALE))
+    final_rect = horizontal if horizontal != original else downward
+    attempts.append(
+        ("absolute_minimum", final_rect, PDF_TRANSLATION_ABSOLUTE_MIN_SCALE)
+    )
+
+    unique_attempts = []
+    seen: set[tuple[float, ...]] = set()
+    for stage, rect, scale_low in attempts:
+        key = (*[round(value, 3) for value in rect], round(scale_low, 3))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_attempts.append((stage, rect, scale_low))
+    return unique_attempts
+
+
+def _fit_pdf_layout_block(page, segment, page_segments) -> dict[str, Any]:
+    layout = segment["layout"]
+    original_bbox = list(layout["bbox"])
+    normalized_text = _normalize_pdf_translated_text(
+        segment["translated_text"], segment.get("kind", "paragraph")
+    )
+    content = _pdf_translation_html(normalized_text)
+    css = _pdf_translation_css(layout)
+    last_rect = None
+    last_scale = PDF_TRANSLATION_ABSOLUTE_MIN_SCALE
+    for stage, rect, scale_low in _pdf_layout_attempts(page, segment, page_segments):
+        last_rect = rect
+        last_scale = scale_low
+        if stage.startswith("expanded"):
+            logger.info(
+                "pdf_layout_bbox_expanded page_number=%s segment_id=%s stage=%s "
+                "original_bbox=%s attempted_bbox=%s",
+                layout["page_number"],
+                segment["segment_id"],
+                stage,
+                original_bbox,
+                _pdf_rect_values(rect),
+            )
+        spare_height, fitted_scale = page.insert_htmlbox(
+            rect,
+            content,
+            css=css,
+            scale_low=scale_low,
+            overlay=True,
+        )
+        if spare_height >= 0:
+            logger.info(
+                "pdf_layout_block_fitted page_number=%s segment_id=%s stage=%s "
+                "bbox=%s scale=%.3f",
+                layout["page_number"],
+                segment["segment_id"],
+                stage,
+                _pdf_rect_values(rect),
+                fitted_scale,
+            )
+            return {
+                "segment": segment,
+                "bbox": _pdf_rect_values(rect),
+                "scale_low": scale_low,
+                "fitted_scale": fitted_scale,
+                "normalized_text": normalized_text,
+                "css": css,
+            }
+
+    attempted_bbox = _pdf_rect_values(last_rect)
+    error = PDFLayoutOverflowError(
+        page_number=int(layout["page_number"]),
+        segment_id=segment["segment_id"],
+        original_bbox=original_bbox,
+        attempted_bbox=attempted_bbox,
+        attempted_scale=last_scale,
+        translated_length=len(str(segment["translated_text"])),
+    )
+    logger.warning(
+        "pdf_layout_overflow error_code=%s page_number=%s segment_id=%s "
+        "original_bbox=%s attempted_bbox=%s attempted_scale=%.3f translated_length=%s",
+        error.error_code,
+        error.page_number,
+        error.segment_id,
+        error.original_bbox,
+        error.attempted_bbox,
+        error.attempted_scale,
+        error.translated_length,
+    )
+    raise error
+
+
+def _preflight_pdf_layout(pdf_document, segments: list[dict[str, Any]]):
+    by_page: dict[int, list[dict[str, Any]]] = {}
     for segment in segments:
+        by_page.setdefault(int(segment["layout"]["page_number"]), []).append(segment)
+    logger.info("pdf_layout_preflight_started segment_count=%s", len(segments))
+    plans = []
+    for segment in segments:
+        page_number = int(segment["layout"]["page_number"])
+        if page_number < 1 or page_number > pdf_document.page_count:
+            raise DocumentTranslationError(f"PDF 第 {page_number} 页不存在")
+        plans.append(
+            _fit_pdf_layout_block(
+                pdf_document[page_number - 1], segment, by_page[page_number]
+            )
+        )
+    return plans
+
+
+def _insert_pdf_translations(pdf_document, plans: list[dict[str, Any]]) -> None:
+    import fitz
+
+    for plan in plans:
+        segment = plan["segment"]
         layout = segment["layout"]
         page = pdf_document[int(layout["page_number"]) - 1]
-        rect = fitz.Rect(layout["bbox"])
-        translated_text = html.escape(segment["translated_text"]).replace("\n", "<br>")
-        font_size = max(4.0, float(layout.get("font_size") or 10.0))
-        font_color = str(layout.get("font_color") or "#000000")
-        font_family = str(layout.get("font_family") or "sans-serif")
-        text_align = str(layout.get("text_align") or "left")
-        css = (
-            "* { margin: 0; padding: 0; } "
-            f"body {{ font-family: {font_family}; font-size: {font_size:.2f}pt; "
-            f"line-height: 1.08; color: {font_color}; text-align: {text_align}; }}"
-        )
-        spare_height, scale = page.insert_htmlbox(
+        rect = fitz.Rect(plan["bbox"])
+        spare_height, _ = page.insert_htmlbox(
             rect,
-            f"<div>{translated_text}</div>",
-            css=css,
-            scale_low=PDF_TRANSLATION_MIN_SCALE,
+            _pdf_translation_html(plan["normalized_text"]),
+            css=plan["css"],
+            scale_low=plan["scale_low"],
             overlay=True,
         )
         if spare_height < 0:
-            raise DocumentTranslationError(
-                f"PDF 第 {layout['page_number']} 页文本块 {segment['segment_id']} "
-                "无法在原区域内完整排版，请缩短译文或降低 PDF_TRANSLATION_MIN_SCALE"
+            raise PDFLayoutOverflowError(
+                page_number=int(layout["page_number"]),
+                segment_id=segment["segment_id"],
+                original_bbox=layout["bbox"],
+                attempted_bbox=plan["bbox"],
+                attempted_scale=plan["scale_low"],
+                translated_length=len(str(segment["translated_text"])),
             )
-        logger.debug(
-            "translation_pdf_block_fitted document_page=%s segment_id=%s scale=%.3f",
-            layout["page_number"],
-            segment["segment_id"],
-            scale,
-        )
 
 
 def _render_pdf_from_original(
@@ -1813,11 +2128,14 @@ def _render_pdf_from_original(
 
     segments = _pdf_segments_with_layout(document_row, result["segments"])
     try:
-        with fitz.open(str(source_path)) as output_document:
-            if output_document.needs_pass:
+        source_bytes = source_path.read_bytes()
+        with fitz.open(stream=source_bytes, filetype="pdf") as preflight_document:
+            if preflight_document.needs_pass:
                 raise DocumentTranslationError("暂不支持加密 PDF 的原版式翻译")
+            plans = _preflight_pdf_layout(preflight_document, segments)
+        with fitz.open(stream=source_bytes, filetype="pdf") as output_document:
             _apply_pdf_text_redactions(output_document, segments)
-            _insert_pdf_translations(output_document, segments)
+            _insert_pdf_translations(output_document, plans)
             return output_document.tobytes(garbage=4, deflate=True)
     except DocumentTranslationError:
         raise

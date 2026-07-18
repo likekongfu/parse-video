@@ -12,6 +12,7 @@ from parse_video_py.document_translation import (
     DocumentTranslationBusyError,
     DocumentTranslationError,
     InvalidTranslationRequestError,
+    PDFLayoutOverflowError,
     create_translation_job,
     get_translation_job,
     render_translation_export,
@@ -39,6 +40,8 @@ def _service_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=404, detail=str(exc).strip("'"))
     if isinstance(exc, DocumentTranslationBusyError):
         return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, PDFLayoutOverflowError):
+        return HTTPException(status_code=422, detail=exc.to_detail())
     if isinstance(exc, InvalidTranslationRequestError):
         return HTTPException(status_code=422, detail=str(exc))
     if isinstance(exc, DocumentTranslationError):
