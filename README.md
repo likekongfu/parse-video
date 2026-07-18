@@ -283,23 +283,27 @@ application database user cannot create tables automatically.
 Document translation sends at most `TRANSLATION_BATCH_SIZE` stable segments per
 DeepSeek request (default `20`). Truncated, invalid, or incomplete batch responses
 are retried at most twice and then bisected; export generation starts only after
-all batches complete successfully. DOCX translation export in `translation` mode
-uses the uploaded DOCX as a template and replaces matching paragraphs/table rows
-in place, so headings, paragraph styles, tables, headers, footers, and embedded
-media are preserved as much as the original document allows. `bilingual` mode
-still generates a readable comparison document because it must add extra source
-and translated paragraphs.
+all batches complete successfully. DOCX segments are created directly from the
+uploaded DOCX structure and carry stable body, table, header, and footer
+locations. Export always reopens the original file and writes translations back
+to those locations. It does not match by text and never creates a replacement
+`Document()` or Heading 2 fallback. Existing section/page settings, paragraph
+properties, runs, tabs, numbering, tables, drawings, hyperlinks, bookmarks, and
+fields remain in the original package. A cached DOCX result without structural
+locations is rejected and must be translated again.
 
-For a text-based PDF translated in `translation` mode, export `format=pdf` to
-reuse the uploaded PDF pages and replace text inside the original page/block
+DOCX sources only export `format=docx`. Text-based PDF sources only support
+`translation` mode and only export `format=pdf`; PDF bilingual mode and PDF to
+DOCX translation export return HTTP `422`. PDF export reuses the uploaded PDF
+pages and replaces text inside the original page/block
 coordinates. Page size, page count, images, vector graphics, and other content
 outside translated text blocks remain in the original PDF. Text is scaled down
 only as far as `PDF_TRANSLATION_MIN_SCALE` (default `0.50`); if a translated block
 still cannot fit, export fails explicitly instead of truncating it. Scanned PDFs,
-encrypted PDFs, and original-layout bilingual PDF export are not supported by
-this path.
+encrypted PDFs, and original-layout bilingual PDF translation are not supported.
 
 ```text
+GET /auth/documents/{document_id}/translations/{translation_id}/export?format=docx
 GET /auth/documents/{document_id}/translations/{translation_id}/export?format=pdf
 ```
 

@@ -17,6 +17,7 @@ from typing import Any, Callable, Iterable
 
 import httpx
 from docx import Document
+from docx.oxml.ns import qn
 from sqlalchemy import and_, delete, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
@@ -31,7 +32,7 @@ from parse_video_py.user_db import (
 PROCESSING_STALE_SECONDS = 10 * 60
 TRANSLATION_BATCH_SIZE = max(1, int(os.getenv("TRANSLATION_BATCH_SIZE", "20")))
 TRANSLATION_BATCH_RETRIES = 2
-TRANSLATION_PIPELINE_VERSION = "pdf-layout-v1"
+TRANSLATION_PIPELINE_VERSION = "structure-location-v3"
 TRANSLATION_JOB_TIMEOUT_SECONDS = max(
     30, int(os.getenv("TRANSLATION_JOB_TIMEOUT_SECONDS", "1800"))
 )
@@ -70,6 +71,10 @@ class DocumentTranslationError(RuntimeError):
 
 class DocumentTranslationBusyError(DocumentTranslationError):
     pass
+
+
+class InvalidTranslationRequestError(DocumentTranslationError):
+    """The requested mode or export format is incompatible with the source file."""
 
 
 class InvalidTranslationResponseError(DocumentTranslationError):
@@ -215,6 +220,200 @@ def segment_document(text: str) -> list[dict[str, str]]:
     if not result:
         raise DocumentTranslationError("可能为扫描件，请使用 OCR")
     return result
+
+
+_DOCX_EXCLUDED_TEXT_ANCESTORS = {
+    qn("w:drawing"),
+    qn("w:object"),
+    qn("w:pict"),
+    qn("w:fldSimple"),
+}
+
+
+def _docx_node_is_excluded(node) -> bool:
+    return any(
+        ancestor.tag in _DOCX_EXCLUDED_TEXT_ANCESTORS
+        for ancestor in node.iterancestors()
+    )
+
+
+def _docx_paragraph_tokens(paragraph) -> list[tuple[str, Any]]:
+    """Return visible text and structural separators without touching field/drawing XML."""
+    tokens: list[tuple[str, Any]] = []
+    field_depth = 0
+    for node in paragraph._p.iter():
+        if node.tag == qn("w:fldChar"):
+            field_type = node.get(qn("w:fldCharType"))
+            if field_type == "begin":
+                field_depth += 1
+            elif field_type == "end":
+                field_depth = max(0, field_depth - 1)
+            continue
+        if field_depth or _docx_node_is_excluded(node):
+            continue
+        if node.tag == qn("w:t"):
+            tokens.append(("text", node))
+        elif node.tag == qn("w:tab"):
+            tokens.append(("tab", node))
+        elif node.tag in (qn("w:br"), qn("w:cr")):
+            tokens.append(("break", node))
+    return tokens
+
+
+def _docx_paragraph_text(paragraph) -> str:
+    parts: list[str] = []
+    for token_type, node in _docx_paragraph_tokens(paragraph):
+        if token_type == "text":
+            parts.append(node.text or "")
+        elif token_type == "tab":
+            parts.append("\t")
+        else:
+            parts.append("\n")
+    return "".join(parts)
+
+
+def _docx_location_id(location: dict[str, Any]) -> str:
+    scope = location["scope"]
+    if scope == "body":
+        return f"body-p{location['paragraph_index'] + 1:04d}"
+    if scope == "table":
+        return (
+            f"table-t{location['table_index'] + 1:04d}"
+            f"-r{location['row_index'] + 1:04d}"
+            f"-c{location['cell_index'] + 1:04d}"
+            f"-p{location['paragraph_index'] + 1:04d}"
+        )
+    prefix = f"{scope}-s{location['section_index'] + 1:04d}" f"-{location['variant']}"
+    if scope in ("header", "footer"):
+        return f"{prefix}-p{location['paragraph_index'] + 1:04d}"
+    return (
+        f"{prefix}-t{location['table_index'] + 1:04d}"
+        f"-r{location['row_index'] + 1:04d}"
+        f"-c{location['cell_index'] + 1:04d}"
+        f"-p{location['paragraph_index'] + 1:04d}"
+    )
+
+
+def _append_docx_segment(
+    segments: list[dict[str, Any]],
+    paragraph,
+    location: dict[str, Any],
+    seen_paragraphs: set[Any],
+) -> None:
+    paragraph_element = paragraph._p
+    if paragraph_element in seen_paragraphs:
+        return
+    seen_paragraphs.add(paragraph_element)
+    source_text = _docx_paragraph_text(paragraph)
+    if not source_text.strip():
+        return
+    segments.append(
+        {
+            "segment_id": _docx_location_id(location),
+            "source_text": source_text,
+            "kind": _segment_kind(source_text),
+            "location": location,
+        }
+    )
+
+
+def _append_docx_table_segments(
+    segments: list[dict[str, Any]],
+    tables,
+    seen_paragraphs: set[Any],
+    *,
+    scope: str,
+    section_index: int | None = None,
+    variant: str | None = None,
+) -> None:
+    for table_index, table in enumerate(tables):
+        for row_index, row in enumerate(table.rows):
+            for cell_index, cell in enumerate(row.cells):
+                for paragraph_index, paragraph in enumerate(cell.paragraphs):
+                    location: dict[str, Any] = {
+                        "scope": scope,
+                        "table_index": table_index,
+                        "row_index": row_index,
+                        "cell_index": cell_index,
+                        "paragraph_index": paragraph_index,
+                    }
+                    if section_index is not None:
+                        location["section_index"] = section_index
+                    if variant is not None:
+                        location["variant"] = variant
+                    _append_docx_segment(segments, paragraph, location, seen_paragraphs)
+
+
+def _docx_story_references(section, story: str):
+    reference_tag = qn(f"w:{story}Reference")
+    references = [child for child in section._sectPr if child.tag == reference_tag]
+    for reference in references:
+        variant = reference.get(qn("w:type"), "default")
+        if story == "header":
+            container = (
+                section.first_page_header
+                if variant == "first"
+                else section.even_page_header if variant == "even" else section.header
+            )
+        else:
+            container = (
+                section.first_page_footer
+                if variant == "first"
+                else section.even_page_footer if variant == "even" else section.footer
+            )
+        yield variant, container
+
+
+def segment_docx_document(path: Path) -> list[dict[str, Any]]:
+    """Create translation segments from stable DOCX structure locations."""
+    source_document = Document(str(path))
+    segments: list[dict[str, Any]] = []
+    seen_paragraphs: set[Any] = set()
+    for paragraph_index, paragraph in enumerate(source_document.paragraphs):
+        _append_docx_segment(
+            segments,
+            paragraph,
+            {"scope": "body", "paragraph_index": paragraph_index},
+            seen_paragraphs,
+        )
+    _append_docx_table_segments(
+        segments,
+        source_document.tables,
+        seen_paragraphs,
+        scope="table",
+    )
+
+    seen_story_parts: set[str] = set()
+    for section_index, section in enumerate(source_document.sections):
+        for story in ("header", "footer"):
+            for variant, container in _docx_story_references(section, story):
+                part_key = str(container.part.partname)
+                if part_key in seen_story_parts:
+                    continue
+                seen_story_parts.add(part_key)
+                for paragraph_index, paragraph in enumerate(container.paragraphs):
+                    _append_docx_segment(
+                        segments,
+                        paragraph,
+                        {
+                            "scope": story,
+                            "section_index": section_index,
+                            "variant": variant,
+                            "paragraph_index": paragraph_index,
+                        },
+                        seen_paragraphs,
+                    )
+                _append_docx_table_segments(
+                    segments,
+                    container.tables,
+                    seen_paragraphs,
+                    scope=f"{story}_table",
+                    section_index=section_index,
+                    variant=variant,
+                )
+    if not segments:
+        raise DocumentTranslationError("文档中没有可翻译文字")
+    return segments
 
 
 def _pdf_block_alignment(block_bbox: tuple[float, ...], lines: list[dict]) -> str:
@@ -881,6 +1080,8 @@ async def translate_document(
         style=style,
         glossary=glossary,
     )
+    if document.get("file_type") == "pdf" and options["mode"] != "translation":
+        raise InvalidTranslationRequestError("PDF翻译暂不支持双语模式")
     task, cached = _acquire_translation(user_id, document_id, options)
     if cached:
         if progress_callback:
@@ -895,6 +1096,8 @@ async def translate_document(
     try:
         if document.get("file_type") == "pdf":
             segments = segment_pdf_document(Path(document["storage_path"]))
+        elif document.get("file_type") == "docx":
+            segments = segment_docx_document(Path(document["storage_path"]))
         else:
             segments = segment_document(document["extracted_text"])
         translated_by_id: dict[str, str] = {}
@@ -1071,11 +1274,14 @@ def create_translation_job(
         style=style,
         glossary=glossary,
     )
-    segments = (
-        segment_pdf_document(Path(document["storage_path"]))
-        if document.get("file_type") == "pdf"
-        else segment_document(document["extracted_text"])
-    )
+    if document.get("file_type") == "pdf" and options["mode"] != "translation":
+        raise InvalidTranslationRequestError("PDF翻译暂不支持双语模式")
+    if document.get("file_type") == "pdf":
+        segments = segment_pdf_document(Path(document["storage_path"]))
+    elif document.get("file_type") == "docx":
+        segments = segment_docx_document(Path(document["storage_path"]))
+    else:
+        segments = segment_document(document["extracted_text"])
     total_batches = max(1, len(list(iter_segment_batches(segments))))
     options_hash = _options_hash(options)
     options_json = json.dumps(options, ensure_ascii=False, separators=(",", ":"))
@@ -1383,100 +1589,133 @@ def get_translation(
     return dict(document), json.loads(row["result_json"])
 
 
-def _normalize_segment_text(value: str) -> str:
-    return re.sub(r"\s+", " ", value or "").strip()
+def _docx_story_container(document, location: dict[str, Any]):
+    section = document.sections[int(location["section_index"])]
+    variant = location["variant"]
+    story = "header" if location["scope"].startswith("header") else "footer"
+    if story == "header":
+        return (
+            section.first_page_header
+            if variant == "first"
+            else section.even_page_header if variant == "even" else section.header
+        )
+    return (
+        section.first_page_footer
+        if variant == "first"
+        else section.even_page_footer if variant == "even" else section.footer
+    )
 
 
-def _set_paragraph_text(paragraph, text: str) -> None:
-    if paragraph.runs:
-        paragraph.runs[0].text = text
-        for run in paragraph.runs[1:]:
-            run.text = ""
-    else:
-        paragraph.add_run(text)
+def _resolve_docx_location(document, location: dict[str, Any]):
+    try:
+        scope = location["scope"]
+        if scope == "body":
+            return document.paragraphs[int(location["paragraph_index"])]
+        if scope == "table":
+            tables = document.tables
+        else:
+            container = _docx_story_container(document, location)
+            if scope in ("header", "footer"):
+                return container.paragraphs[int(location["paragraph_index"])]
+            tables = container.tables
+        table = tables[int(location["table_index"])]
+        row = table.rows[int(location["row_index"])]
+        cell = row.cells[int(location["cell_index"])]
+        return cell.paragraphs[int(location["paragraph_index"])]
+    except (IndexError, KeyError, TypeError, ValueError) as exc:
+        raise DocumentTranslationError(
+            f"DOCX结构位置无效：{json.dumps(location, ensure_ascii=False)}"
+        ) from exc
 
 
-def _table_row_text(row) -> str:
-    cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
-    return " | ".join(cells)
+def _assign_docx_text_nodes(text_nodes: list[Any], translated_text: str) -> None:
+    if not text_nodes:
+        raise DocumentTranslationError("DOCX目标段落缺少可回填文本节点")
+    original_lengths = [max(1, len(node.text or "")) for node in text_nodes]
+    remaining_text = translated_text
+    remaining_weight = sum(original_lengths)
+    for index, (node, weight) in enumerate(zip(text_nodes, original_lengths)):
+        if index == len(text_nodes) - 1:
+            value = remaining_text
+        else:
+            take = round(len(remaining_text) * weight / max(1, remaining_weight))
+            value = remaining_text[:take]
+            remaining_text = remaining_text[take:]
+            remaining_weight -= weight
+        node.text = value
+        xml_space = "{http://www.w3.org/XML/1998/namespace}space"
+        if value.startswith(" ") or value.endswith(" "):
+            node.set(xml_space, "preserve")
+        elif xml_space in node.attrib:
+            del node.attrib[xml_space]
 
 
-def _replace_table_row_text(row, translated_text: str) -> None:
-    translated_cells = [part.strip() for part in translated_text.split("|")]
-    non_empty_cells = [cell for cell in row.cells if cell.text.strip()]
-    target_cells = non_empty_cells or list(row.cells)
-    if len(translated_cells) == len(target_cells) and len(target_cells) > 1:
-        for cell, text in zip(target_cells, translated_cells, strict=False):
-            if cell.paragraphs:
-                _set_paragraph_text(cell.paragraphs[0], text)
-                for paragraph in cell.paragraphs[1:]:
-                    _set_paragraph_text(paragraph, "")
-            else:
-                cell.text = text
+def _replace_docx_paragraph_text(paragraph, translated_text: str) -> None:
+    tokens = _docx_paragraph_tokens(paragraph)
+    text_groups: list[list[Any]] = [[]]
+    for token_type, node in tokens:
+        if token_type == "text":
+            text_groups[-1].append(node)
+        else:
+            text_groups.append([])
+    non_empty_groups = [group for group in text_groups if group]
+    if not non_empty_groups:
+        raise DocumentTranslationError("DOCX目标段落缺少可回填文本节点")
+
+    translated_parts = re.split(r"[\t\r\n]", translated_text)
+    if len(translated_parts) == len(text_groups) and all(text_groups):
+        for group, part in zip(text_groups, translated_parts, strict=False):
+            _assign_docx_text_nodes(group, part)
         return
 
-    if target_cells:
-        first = target_cells[0]
-        if first.paragraphs:
-            _set_paragraph_text(first.paragraphs[0], translated_text)
-            for paragraph in first.paragraphs[1:]:
-                _set_paragraph_text(paragraph, "")
-        else:
-            first.text = translated_text
-        for cell in target_cells[1:]:
-            for paragraph in cell.paragraphs:
-                _set_paragraph_text(paragraph, "")
-
-
-def _docx_translation_targets(document: Document) -> list[tuple[str, Any, str]]:
-    targets: list[tuple[str, Any, str]] = []
-    for paragraph in document.paragraphs:
-        source = paragraph.text.strip()
-        if source:
-            targets.append(("paragraph", paragraph, source))
-    for table in document.tables:
-        for row in table.rows:
-            source = _table_row_text(row)
-            if source:
-                targets.append(("table_row", row, source))
-    return targets
+    # The model may omit structural separators. Keep the original w:tab / w:br
+    # nodes and distribute only translated characters across existing w:t nodes.
+    flattened_nodes = [node for group in text_groups for node in group]
+    plain_text = re.sub(r"[\t\r\n]", "", translated_text)
+    _assign_docx_text_nodes(flattened_nodes, plain_text)
 
 
 def _render_docx_from_original(
-    document_row: dict[str, Any], segments: list[dict[str, str]]
-) -> bytes | None:
+    document_row: dict[str, Any], segments: list[dict[str, Any]]
+) -> bytes:
     source_path = Path(str(document_row.get("storage_path") or ""))
     if document_row.get("file_type") != "docx" or not source_path.is_file():
-        return None
+        raise InvalidTranslationRequestError("只有DOCX原文件可以导出译文DOCX")
+    if not segments or any(
+        not isinstance(segment.get("location"), dict) for segment in segments
+    ):
+        raise InvalidTranslationRequestError(
+            "旧DOCX翻译结果缺少结构位置，请重新翻译后再导出"
+        )
 
     output_document = Document(str(source_path))
-    targets = _docx_translation_targets(output_document)
-    if len(targets) != len(segments):
-        logger.info(
-            "translation_docx_template_mismatch document_id=%s target_count=%d segment_count=%d",
+    backfilled = 0
+    try:
+        for segment in segments:
+            paragraph = _resolve_docx_location(output_document, segment["location"])
+            _replace_docx_paragraph_text(paragraph, segment["translated_text"])
+            backfilled += 1
+    except DocumentTranslationError:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "translation_docx_backfill_failed document_id=%s segment_id=%s",
             document_row.get("id"),
-            len(targets),
-            len(segments),
+            segment.get("segment_id"),
         )
-        return None
-
-    for (target_type, target, source), segment in zip(targets, segments, strict=False):
-        if _normalize_segment_text(source) != _normalize_segment_text(
-            segment["source_text"]
-        ):
-            logger.info(
-                "translation_docx_template_text_mismatch document_id=%s segment_id=%s",
-                document_row.get("id"),
-                segment.get("segment_id"),
-            )
-            return None
-        if target_type == "paragraph":
-            _set_paragraph_text(target, segment["translated_text"])
-        else:
-            _replace_table_row_text(target, segment["translated_text"])
+        raise DocumentTranslationError(
+            f"DOCX原格式回填失败：{segment.get('segment_id')}"
+        ) from exc
+    if backfilled != len(segments):
+        raise DocumentTranslationError(
+            f"DOCX原格式回填不完整：{backfilled}/{len(segments)}"
+        )
 
     stream = io.BytesIO()
-    output_document.save(stream)
+    try:
+        output_document.save(stream)
+    except Exception as exc:
+        raise DocumentTranslationError("DOCX原格式文件生成失败") from exc
     return stream.getvalue()
 
 
@@ -1485,22 +1724,9 @@ def _pdf_segments_with_layout(
 ) -> list[dict[str, Any]]:
     if all(isinstance(segment.get("layout"), dict) for segment in segments):
         return segments
-
-    # Compatibility for a completed translation created before layout metadata was
-    # persisted. Only attach coordinates when block boundaries still match exactly.
-    current = segment_pdf_document(Path(document_row["storage_path"]))
-    if len(current) != len(segments):
-        raise DocumentTranslationError("旧翻译结果缺少版式信息，请重新翻译后再导出 PDF")
-    merged: list[dict[str, Any]] = []
-    for stored, extracted in zip(segments, current, strict=False):
-        if _normalize_segment_text(stored["source_text"]) != _normalize_segment_text(
-            extracted["source_text"]
-        ):
-            raise DocumentTranslationError(
-                "旧翻译结果缺少版式信息，请重新翻译后再导出 PDF"
-            )
-        merged.append({**stored, "layout": extracted["layout"]})
-    return merged
+    raise InvalidTranslationRequestError(
+        "旧PDF翻译结果缺少版式信息，请重新翻译后再导出PDF"
+    )
 
 
 def _apply_pdf_text_redactions(pdf_document, segments: list[dict[str, Any]]) -> None:
@@ -1576,9 +1802,9 @@ def _render_pdf_from_original(
     document_row: dict[str, Any], result: dict[str, Any]
 ) -> bytes:
     if document_row.get("file_type") != "pdf":
-        raise DocumentTranslationError("只有 PDF 原文件可以导出原版式 PDF")
+        raise InvalidTranslationRequestError("只有PDF原文件可以导出原版式PDF")
     if result.get("mode") != "translation":
-        raise DocumentTranslationError("原版式 PDF 暂只支持纯译文模式")
+        raise InvalidTranslationRequestError("PDF翻译暂不支持双语模式")
     source_path = Path(str(document_row.get("storage_path") or ""))
     if not source_path.is_file():
         raise DocumentTranslationError("PDF 原文件不存在")
@@ -1608,42 +1834,20 @@ def render_translation_export(
     user_id: str, document_id: str, translation_id: str, export_format: str
 ) -> tuple[bytes, str, str]:
     document, result = get_translation(user_id, document_id, translation_id)
-    if export_format not in {"docx", "txt", "pdf"}:
-        raise DocumentTranslationError("仅支持导出 PDF、DOCX 或 TXT")
-    bilingual = result["mode"] == "bilingual"
-    segments = result["segments"]
-    if export_format == "pdf":
+    file_type = document.get("file_type")
+    if file_type == "pdf":
+        if export_format != "pdf":
+            raise InvalidTranslationRequestError("PDF翻译结果仅支持导出为PDF")
         payload = _render_pdf_from_original(document, result)
         media_type = "application/pdf"
-    elif export_format == "txt":
-        parts = []
-        for segment in segments:
-            if bilingual:
-                parts.append(
-                    f"原文：\n{segment['source_text']}\n\n译文：\n{segment['translated_text']}"
-                )
-            else:
-                parts.append(segment["translated_text"])
-        payload = "\n\n".join(parts).encode("utf-8-sig")
-        media_type = "text/plain; charset=utf-8"
-    else:
-        payload = None if bilingual else _render_docx_from_original(document, segments)
-        if payload is None:
-            output_document = Document()
-            for segment in segments:
-                if bilingual:
-                    source = output_document.add_paragraph()
-                    source.add_run(segment["source_text"]).italic = True
-                    output_document.add_paragraph(segment["translated_text"])
-                elif segment["kind"] == "heading":
-                    output_document.add_heading(segment["translated_text"], level=2)
-                else:
-                    output_document.add_paragraph(segment["translated_text"])
-            stream = io.BytesIO()
-            output_document.save(stream)
-            payload = stream.getvalue()
+    elif file_type == "docx":
+        if export_format != "docx":
+            raise InvalidTranslationRequestError("DOCX翻译结果仅支持导出为DOCX")
+        payload = _render_docx_from_original(document, result["segments"])
         media_type = (
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         )
+    else:
+        raise InvalidTranslationRequestError("该文档格式不支持翻译导出")
     base_name = document["filename"].rsplit(".", 1)[0] or "translation"
     return payload, media_type, f"{base_name}-translated.{export_format}"

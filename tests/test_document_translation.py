@@ -1,13 +1,20 @@
 import asyncio
 import io
+import inspect
 import json
 import logging
 from collections import Counter
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 import fitz
 from docx import Document
+from docx.enum.section import WD_ORIENT, WD_SECTION
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
+from docx.shared import Inches, RGBColor
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, func, select
@@ -17,6 +24,107 @@ import parse_video_py.document_summary_web as summary_web
 import parse_video_py.document_translation as translation_service
 import parse_video_py.document_translation_web as translation_web
 import parse_video_py.user_db as user_db
+
+_SAMPLE_PNG = (Path(__file__).parent / "assets" / "sample_ocr.png").read_bytes()
+
+
+def _add_hyperlink(paragraph, text: str, url: str) -> None:
+    relationship_id = paragraph.part.relate_to(url, RT.HYPERLINK, is_external=True)
+    hyperlink = OxmlElement("w:hyperlink")
+    hyperlink.set(qn("r:id"), relationship_id)
+    run = OxmlElement("w:r")
+    run_properties = OxmlElement("w:rPr")
+    color = OxmlElement("w:color")
+    color.set(qn("w:val"), "0563C1")
+    run_properties.append(color)
+    text_node = OxmlElement("w:t")
+    text_node.text = text
+    run.extend((run_properties, text_node))
+    hyperlink.append(run)
+    paragraph._p.append(hyperlink)
+
+
+def _add_page_field(paragraph) -> None:
+    begin = paragraph.add_run()
+    begin_node = OxmlElement("w:fldChar")
+    begin_node.set(qn("w:fldCharType"), "begin")
+    begin._r.append(begin_node)
+    instruction = paragraph.add_run()
+    instruction_node = OxmlElement("w:instrText")
+    instruction_node.set(qn("xml:space"), "preserve")
+    instruction_node.text = " PAGE "
+    instruction._r.append(instruction_node)
+    separate = paragraph.add_run()
+    separate_node = OxmlElement("w:fldChar")
+    separate_node.set(qn("w:fldCharType"), "separate")
+    separate._r.append(separate_node)
+    paragraph.add_run("1")
+    end = paragraph.add_run()
+    end_node = OxmlElement("w:fldChar")
+    end_node.set(qn("w:fldCharType"), "end")
+    end._r.append(end_node)
+
+
+def _docx_structure_snapshot(document) -> dict:
+    story_structure = []
+    for section in document.sections:
+        for story in (section.header, section.footer):
+            story_structure.append(
+                {
+                    "linked": story.is_linked_to_previous,
+                    "paragraph_styles": [
+                        paragraph.style.name for paragraph in story.paragraphs
+                    ],
+                    "table_count": len(story.tables),
+                    "drawing_count": len(story._element.xpath(".//w:drawing")),
+                    "hyperlink_count": len(story._element.xpath(".//w:hyperlink")),
+                    "tab_count": len(story._element.xpath(".//w:tab")),
+                    "break_count": len(story._element.xpath(".//w:br")),
+                    "field_count": len(story._element.xpath(".//w:fldChar")),
+                    "paragraph_properties": [
+                        node.xml for node in story._element.xpath(".//w:pPr")
+                    ],
+                    "run_properties": [
+                        node.xml for node in story._element.xpath(".//w:rPr")
+                    ],
+                    "table_properties": [
+                        node.xml for node in story._element.xpath(".//w:tblPr")
+                    ],
+                }
+            )
+    return {
+        "sections": [
+            (
+                section.orientation,
+                section.page_width,
+                section.page_height,
+                section.top_margin,
+                section.right_margin,
+                section.bottom_margin,
+                section.left_margin,
+            )
+            for section in document.sections
+        ],
+        "paragraph_styles": [paragraph.style.name for paragraph in document.paragraphs],
+        "table_count": len(document.tables),
+        "inline_shape_count": len(document.inline_shapes),
+        "drawing_count": len(document.element.xpath(".//w:drawing")),
+        "hyperlink_count": len(document.element.xpath(".//w:hyperlink")),
+        "tab_count": len(document.element.xpath(".//w:tab")),
+        "break_count": len(document.element.xpath(".//w:br")),
+        "bookmark_start_count": len(document.element.xpath(".//w:bookmarkStart")),
+        "bookmark_end_count": len(document.element.xpath(".//w:bookmarkEnd")),
+        "field_count": len(document.element.xpath(".//w:fldChar")),
+        "paragraph_properties": [
+            node.xml for node in document.element.xpath(".//w:pPr")
+        ],
+        "run_properties": [node.xml for node in document.element.xpath(".//w:rPr")],
+        "table_properties": [node.xml for node in document.element.xpath(".//w:tblPr")],
+        "section_properties": [
+            node.xml for node in document.element.xpath(".//w:sectPr")
+        ],
+        "stories": story_structure,
+    }
 
 
 def _docx_bytes() -> bytes:
@@ -40,15 +148,55 @@ def _many_paragraph_docx_bytes(count: int = 45) -> bytes:
 
 def _styled_docx_bytes() -> bytes:
     document = Document()
+    first_section = document.sections[0]
+    first_section.page_width = Inches(8.27)
+    first_section.page_height = Inches(11.69)
+    first_section.top_margin = Inches(0.7)
+    first_section.right_margin = Inches(0.8)
+    first_section.bottom_margin = Inches(0.9)
+    first_section.left_margin = Inches(1.0)
+    first_section.header.paragraphs[0].text = "Agreement header"
+    first_section.footer.paragraphs[0].text = "Page "
+    _add_page_field(first_section.footer.paragraphs[0])
     document.add_heading("1. Service Agreement", level=1)
     paragraph = document.add_paragraph(
         "The total amount is USD 1,200. Visit https://example.com."
     )
     paragraph.style = "Intense Quote"
+    paragraph.runs[0].font.bold = True
+    paragraph.runs[0].font.italic = True
+    paragraph.runs[0].font.color.rgb = RGBColor(0x44, 0x55, 0x66)
+    ordinary = document.add_paragraph(style="Normal")
+    ordinary.add_run("Short body ").bold = True
+    ordinary.add_run("with mixed formatting. ").italic = True
+    _add_hyperlink(ordinary, "OpenAI", "https://openai.com")
+    ordinary.add_run("\tTabbed")
+    ordinary.add_run().add_break()
+    bookmark_start = OxmlElement("w:bookmarkStart")
+    bookmark_start.set(qn("w:id"), "42")
+    bookmark_start.set(qn("w:name"), "translationBookmark")
+    bookmark_end = OxmlElement("w:bookmarkEnd")
+    bookmark_end.set(qn("w:id"), "42")
+    ordinary._p.insert(0, bookmark_start)
+    ordinary._p.append(bookmark_end)
+    ordinary.add_run().add_picture(io.BytesIO(_SAMPLE_PNG), width=Inches(0.2))
     table = document.add_table(rows=1, cols=2)
     table.style = "Table Grid"
     table.rows[0].cells[0].text = "Item"
     table.rows[0].cells[1].text = "Amount"
+    second_section = document.add_section(WD_SECTION.NEW_PAGE)
+    second_section.orientation = WD_ORIENT.LANDSCAPE
+    second_section.page_width = Inches(11.69)
+    second_section.page_height = Inches(8.27)
+    second_section.top_margin = Inches(0.6)
+    second_section.right_margin = Inches(0.6)
+    second_section.bottom_margin = Inches(0.6)
+    second_section.left_margin = Inches(0.6)
+    second_section.header.is_linked_to_previous = False
+    second_section.header.paragraphs[0].text = "Second section header"
+    second_section.footer.is_linked_to_previous = False
+    second_section.footer.paragraphs[0].text = "Second section footer"
+    document.add_paragraph("Second section body", style="List Number")
     output = io.BytesIO()
     document.save(output)
     return output.getvalue()
@@ -72,6 +220,7 @@ def _styled_pdf_bytes() -> bytes:
         fontsize=11,
         fontname="helv",
     )
+    page.insert_image(fitz.Rect(350, 230, 385, 265), stream=_SAMPLE_PNG)
     payload = document.tobytes(deflate=True)
     document.close()
     return payload
@@ -181,12 +330,12 @@ def test_translation_cache_modes_glossary_and_exports(monkeypatch, tmp_path):
             cookies={"web_session": "session"},
         )
         translation_id = completed["result"]["translation_id"]
-        txt = client.get(
-            f"/auth/documents/{document_id}/translations/{translation_id}/export?format=txt",
-            cookies={"web_session": "session"},
-        )
         docx = client.get(
             f"/auth/documents/{document_id}/translations/{translation_id}/export?format=docx",
+            cookies={"web_session": "session"},
+        )
+        invalid_pdf_export = client.get(
+            f"/auth/documents/{document_id}/translations/{translation_id}/export?format=pdf",
             cookies={"web_session": "session"},
         )
 
@@ -194,18 +343,19 @@ def test_translation_cache_modes_glossary_and_exports(monkeypatch, tmp_path):
     assert completed["result"]["cached"] is False
     assert completed["result"]["detected_source_language"] == "en"
     assert [item["segment_id"] for item in completed["result"]["segments"]] == [
-        "seg-0001",
-        "seg-0002",
-        "seg-0003",
+        "body-p0001",
+        "body-p0002",
+        "body-p0003",
     ]
+    assert all(item.get("location") for item in completed["result"]["segments"])
     assert second.status_code == 202
     assert second.json()["job_id"] == first.json()["job_id"]
     assert second.json()["status"] == "completed"
     assert mocked_ai.await_count == 1
-    assert txt.status_code == 200
-    assert "原文：" in txt.content.decode("utf-8-sig")
     assert docx.status_code == 200
     assert docx.content.startswith(b"PK")
+    assert invalid_pdf_export.status_code == 422
+    assert invalid_pdf_export.json()["detail"] == "DOCX翻译结果仅支持导出为DOCX"
     with engine.connect() as conn:
         count = conn.execute(
             select(func.count())
@@ -217,9 +367,12 @@ def test_translation_cache_modes_glossary_and_exports(monkeypatch, tmp_path):
 
 def test_docx_translation_export_preserves_original_layout(monkeypatch, tmp_path):
     client, user, _ = _build_app(monkeypatch, tmp_path)
+    source_bytes = _styled_docx_bytes()
+    source_document = Document(io.BytesIO(source_bytes))
+    source_snapshot = _docx_structure_snapshot(source_document)
     with patch.object(summary_web, "verify_web_session", return_value=user):
         document_id = _upload_bytes_and_parse(
-            client, _styled_docx_bytes(), "styled-agreement.docx"
+            client, source_bytes, "styled-agreement.docx"
         )
     mocked_ai = AsyncMock(side_effect=_translated_batch)
     with (
@@ -234,21 +387,57 @@ def test_docx_translation_export_preserves_original_layout(monkeypatch, tmp_path
         )
         completed = _complete_translation_job(client, translated)
         translation_id = completed["result"]["translation_id"]
-        exported = client.get(
-            f"/auth/documents/{document_id}/translations/{translation_id}/export?format=docx",
-            cookies={"web_session": "session"},
-        )
+        with patch.object(
+            translation_service, "Document", wraps=Document
+        ) as document_factory:
+            exported = client.get(
+                f"/auth/documents/{document_id}/translations/{translation_id}/export?format=docx",
+                cookies={"web_session": "session"},
+            )
 
     assert exported.status_code == 200
     output = Document(io.BytesIO(exported.content))
-    assert len(output.tables) == 1
+    assert _docx_structure_snapshot(output) == source_snapshot
+    assert all(call.args and call.args[0] for call in document_factory.call_args_list)
+    assert "Document()" not in inspect.getsource(
+        translation_service._render_docx_from_original
+    )
+    assert "add_heading" not in inspect.getsource(
+        translation_service._render_docx_from_original
+    )
     assert output.paragraphs[0].style.name == "Heading 1"
     assert output.paragraphs[0].text == "译文：1. Service Agreement"
     assert output.paragraphs[1].style.name == "Intense Quote"
     assert output.paragraphs[1].text.startswith("译文：The total amount")
+    assert output.paragraphs[2].style.name == "Normal"
+    assert output.paragraphs[-1].style.name == "List Number"
     assert output.tables[0].style.name == "Table Grid"
     assert output.tables[0].rows[0].cells[0].text == "译文：Item"
-    assert output.tables[0].rows[0].cells[1].text == "Amount"
+    assert output.tables[0].rows[0].cells[1].text == "译文：Amount"
+
+    result_segments = completed["result"]["segments"]
+    assert result_segments
+    assert all(segment.get("location") for segment in result_segments)
+    assert {segment["location"]["scope"] for segment in result_segments} >= {
+        "body",
+        "table",
+        "header",
+        "footer",
+    }
+    for segment in result_segments:
+        paragraph = translation_service._resolve_docx_location(
+            output, segment["location"]
+        )
+        text_nodes = [
+            node
+            for token_type, node in translation_service._docx_paragraph_tokens(
+                paragraph
+            )
+            if token_type == "text"
+        ]
+        actual_text = "".join(node.text or "" for node in text_nodes)
+        expected_text = segment["translated_text"].replace("\t", "").replace("\n", "")
+        assert actual_text == expected_text
 
 
 def test_pdf_translation_export_preserves_original_page_layout(monkeypatch, tmp_path):
@@ -293,23 +482,52 @@ def test_pdf_translation_export_preserves_original_page_layout(monkeypatch, tmp_
             f"/auth/documents/{document_id}/translations/{translation_id}/export?format=pdf",
             cookies={"web_session": "session"},
         )
+        invalid_docx_export = client.get(
+            f"/auth/documents/{document_id}/translations/{translation_id}/export?format=docx",
+            cookies={"web_session": "session"},
+        )
 
     assert exported.status_code == 200
+    assert invalid_docx_export.status_code == 422
+    assert invalid_docx_export.json()["detail"] == "PDF翻译结果仅支持导出为PDF"
     assert exported.headers["content-type"].startswith("application/pdf")
     with fitz.open(stream=source_bytes, filetype="pdf") as source_document:
         source_page = source_document[0]
         source_size = (source_page.rect.width, source_page.rect.height)
         source_drawing_count = len(source_page.get_drawings())
+        source_image_count = len(source_page.get_images(full=True))
     with fitz.open(stream=exported.content, filetype="pdf") as output_document:
         assert output_document.page_count == 1
         output_page = output_document[0]
         assert (output_page.rect.width, output_page.rect.height) == source_size
         assert len(output_page.get_drawings()) >= source_drawing_count
+        assert len(output_page.get_images(full=True)) == source_image_count
         output_text = output_page.get_text("text")
         assert "Service Agreement" not in output_text
         assert "The total amount is USD 1,200." not in output_text
         assert "服务协议" in output_text
         assert "总金额为 1,200 美元" in output_text
+        for segment in completed["result"]["segments"]:
+            translated_text = segment["translated_text"]
+            bbox_text = output_page.get_textbox(fitz.Rect(segment["layout"]["bbox"]))
+            assert translated_text in bbox_text
+
+    with (
+        patch.object(translation_web, "_current_user", return_value=user),
+        patch.object(
+            translation_service,
+            "_insert_pdf_translations",
+            side_effect=translation_service.DocumentTranslationError(
+                "PDF版式写入失败：测试错误"
+            ),
+        ),
+    ):
+        failed_export = client.get(
+            f"/auth/documents/{document_id}/translations/{translation_id}/export?format=pdf",
+            cookies={"web_session": "session"},
+        )
+    assert failed_export.status_code == 502
+    assert failed_export.json()["detail"] == "PDF版式写入失败：测试错误"
 
 
 def test_original_layout_pdf_export_rejects_bilingual_mode(monkeypatch, tmp_path):
@@ -318,25 +536,39 @@ def test_original_layout_pdf_export_rejects_bilingual_mode(monkeypatch, tmp_path
         document_id = _upload_bytes_and_parse(
             client, _styled_pdf_bytes(), "agreement.pdf"
         )
-    mocked_ai = AsyncMock(side_effect=_translated_batch)
-    with (
-        patch.object(translation_web, "_current_user", return_value=user),
-        patch.object(translation_service, "call_deepseek_translation", mocked_ai),
-    ):
+    with patch.object(translation_web, "_current_user", return_value=user):
         translated = client.post(
             f"/auth/documents/{document_id}/translate",
             json={"target_language": "zh-CN", "mode": "bilingual"},
             cookies={"web_session": "session"},
         )
-        completed = _complete_translation_job(client, translated)
-        translation_id = completed["result"]["translation_id"]
-        exported = client.get(
-            f"/auth/documents/{document_id}/translations/{translation_id}/export?format=pdf",
-            cookies={"web_session": "session"},
+
+    assert translated.status_code == 422
+    assert translated.json()["detail"] == "PDF翻译暂不支持双语模式"
+
+
+def test_old_docx_result_without_location_requires_retranslation(monkeypatch, tmp_path):
+    client, user, _ = _build_app(monkeypatch, tmp_path)
+    with patch.object(summary_web, "verify_web_session", return_value=user):
+        document_id = _upload_and_parse(client)
+    document = translation_service.get_owned_document(user.id, document_id)
+
+    with pytest.raises(
+        translation_service.InvalidTranslationRequestError,
+        match="旧DOCX翻译结果缺少结构位置，请重新翻译后再导出",
+    ):
+        translation_service._render_docx_from_original(
+            document,
+            [
+                {
+                    "segment_id": "seg-0001",
+                    "source_text": "Service Agreement",
+                    "translated_text": "服务协议",
+                }
+            ],
         )
 
-    assert exported.status_code == 502
-    assert exported.json()["detail"] == "原版式 PDF 暂只支持纯译文模式"
+    assert translation_service.TRANSLATION_PIPELINE_VERSION == "structure-location-v3"
 
 
 def test_changed_options_create_separate_cached_result(monkeypatch, tmp_path):

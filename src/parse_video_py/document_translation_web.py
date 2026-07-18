@@ -11,6 +11,7 @@ from parse_video_py.document_summary_web import _current_user
 from parse_video_py.document_translation import (
     DocumentTranslationBusyError,
     DocumentTranslationError,
+    InvalidTranslationRequestError,
     create_translation_job,
     get_translation_job,
     render_translation_export,
@@ -38,6 +39,8 @@ def _service_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=404, detail=str(exc).strip("'"))
     if isinstance(exc, DocumentTranslationBusyError):
         return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, InvalidTranslationRequestError):
+        return HTTPException(status_code=422, detail=str(exc))
     if isinstance(exc, DocumentTranslationError):
         message = str(exc)
         if message == "DeepSeek API 未配置":
@@ -85,8 +88,8 @@ def export_translation(
     document_id: str,
     translation_id: str,
     format: str = Query(
-        pattern="^(pdf|docx|txt)$",
-        description="导出格式；PDF 原文件可用 pdf 保留原页面版式",
+        pattern="^(pdf|docx)$",
+        description="DOCX原文件仅导出docx；PDF原文件仅导出pdf",
     ),
 ):
     user = _current_user(request)
