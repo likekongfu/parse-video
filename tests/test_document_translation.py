@@ -1,5 +1,8 @@
+import asyncio
 import io
 import json
+import logging
+from collections import Counter
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -21,6 +24,15 @@ def _docx_bytes() -> bytes:
     document.add_heading("1. Service Agreement", level=1)
     document.add_paragraph("The total amount is USD 1,200. Visit https://example.com.")
     document.add_paragraph("Delivery date: 2026-08-01.")
+    output = io.BytesIO()
+    document.save(output)
+    return output.getvalue()
+
+
+def _many_paragraph_docx_bytes(count: int = 45) -> bytes:
+    document = Document()
+    for index in range(count):
+        document.add_paragraph(f"Paragraph {index} needs translation.")
     output = io.BytesIO()
     document.save(output)
     return output.getvalue()
@@ -84,6 +96,9 @@ def _build_app(monkeypatch, tmp_path):
     monkeypatch.setattr(user_db, "_engine", engine)
     monkeypatch.setattr(summary_service, "_engine", engine)
     monkeypatch.setattr(translation_service, "_engine", engine)
+    monkeypatch.setattr(
+        translation_web, "schedule_translation_job", lambda _job_id: None
+    )
     monkeypatch.setattr(summary_web, "UPLOAD_DIR", tmp_path / "uploads")
     user_db.init_user_database()
     user = user_db.get_or_create_user("translation-user-openid")
@@ -91,6 +106,19 @@ def _build_app(monkeypatch, tmp_path):
     app.include_router(summary_web.router)
     app.include_router(translation_web.router)
     return TestClient(app), user, engine
+
+
+def _complete_translation_job(client, response):
+    assert response.status_code == 202
+    job_id = response.json()["job_id"]
+    asyncio.run(translation_service.run_translation_job(job_id))
+    status = client.get(
+        f"/auth/documents/translation-jobs/{job_id}",
+        cookies={"web_session": "session"},
+    )
+    assert status.status_code == 200
+    assert status.json()["status"] == "completed"
+    return status.json()
 
 
 def _upload_and_parse(client):
@@ -146,12 +174,13 @@ def test_translation_cache_modes_glossary_and_exports(monkeypatch, tmp_path):
             json=payload,
             cookies={"web_session": "session"},
         )
+        completed = _complete_translation_job(client, first)
         second = client.post(
             f"/auth/documents/{document_id}/translate",
             json=payload,
             cookies={"web_session": "session"},
         )
-        translation_id = first.json()["translation_id"]
+        translation_id = completed["result"]["translation_id"]
         txt = client.get(
             f"/auth/documents/{document_id}/translations/{translation_id}/export?format=txt",
             cookies={"web_session": "session"},
@@ -161,15 +190,17 @@ def test_translation_cache_modes_glossary_and_exports(monkeypatch, tmp_path):
             cookies={"web_session": "session"},
         )
 
-    assert first.status_code == 200
-    assert first.json()["cached"] is False
-    assert first.json()["detected_source_language"] == "en"
-    assert [item["segment_id"] for item in first.json()["segments"]] == [
+    assert first.status_code == 202
+    assert completed["result"]["cached"] is False
+    assert completed["result"]["detected_source_language"] == "en"
+    assert [item["segment_id"] for item in completed["result"]["segments"]] == [
         "seg-0001",
         "seg-0002",
         "seg-0003",
     ]
-    assert second.json()["cached"] is True
+    assert second.status_code == 202
+    assert second.json()["job_id"] == first.json()["job_id"]
+    assert second.json()["status"] == "completed"
     assert mocked_ai.await_count == 1
     assert txt.status_code == 200
     assert "原文：" in txt.content.decode("utf-8-sig")
@@ -201,7 +232,8 @@ def test_docx_translation_export_preserves_original_layout(monkeypatch, tmp_path
             json={"target_language": "zh-CN", "mode": "translation"},
             cookies={"web_session": "session"},
         )
-        translation_id = translated.json()["translation_id"]
+        completed = _complete_translation_job(client, translated)
+        translation_id = completed["result"]["translation_id"]
         exported = client.get(
             f"/auth/documents/{document_id}/translations/{translation_id}/export?format=docx",
             cookies={"web_session": "session"},
@@ -250,12 +282,13 @@ def test_pdf_translation_export_preserves_original_page_layout(monkeypatch, tmp_
             json={"target_language": "zh-CN", "mode": "translation"},
             cookies={"web_session": "session"},
         )
-        assert translated.status_code == 200
-        assert [item["segment_id"] for item in translated.json()["segments"]] == [
+        completed = _complete_translation_job(client, translated)
+        assert translated.status_code == 202
+        assert [item["segment_id"] for item in completed["result"]["segments"]] == [
             "p0001-b0001",
             "p0001-b0002",
         ]
-        translation_id = translated.json()["translation_id"]
+        translation_id = completed["result"]["translation_id"]
         exported = client.get(
             f"/auth/documents/{document_id}/translations/{translation_id}/export?format=pdf",
             cookies={"web_session": "session"},
@@ -295,7 +328,8 @@ def test_original_layout_pdf_export_rejects_bilingual_mode(monkeypatch, tmp_path
             json={"target_language": "zh-CN", "mode": "bilingual"},
             cookies={"web_session": "session"},
         )
-        translation_id = translated.json()["translation_id"]
+        completed = _complete_translation_job(client, translated)
+        translation_id = completed["result"]["translation_id"]
         exported = client.get(
             f"/auth/documents/{document_id}/translations/{translation_id}/export?format=pdf",
             cookies={"web_session": "session"},
@@ -319,14 +353,217 @@ def test_changed_options_create_separate_cached_result(monkeypatch, tmp_path):
             json={"target_language": "zh-CN", "style": "general"},
             cookies={"web_session": "session"},
         )
+        completed_general = _complete_translation_job(client, general)
         technical = client.post(
             f"/auth/documents/{document_id}/translate",
             json={"target_language": "zh-CN", "style": "technical"},
             cookies={"web_session": "session"},
         )
-    assert general.status_code == technical.status_code == 200
-    assert general.json()["translation_id"] != technical.json()["translation_id"]
+        completed_technical = _complete_translation_job(client, technical)
+    assert general.status_code == technical.status_code == 202
+    assert (
+        completed_general["result"]["translation_id"]
+        != completed_technical["result"]["translation_id"]
+    )
     assert mocked_ai.await_count == 2
+
+
+def test_duplicate_job_submission_schedules_only_once(monkeypatch, tmp_path):
+    client, user, _ = _build_app(monkeypatch, tmp_path)
+    with patch.object(summary_web, "verify_web_session", return_value=user):
+        document_id = _upload_and_parse(client)
+    scheduled = []
+    with (
+        patch.object(translation_web, "_current_user", return_value=user),
+        patch.object(
+            translation_web,
+            "schedule_translation_job",
+            side_effect=lambda job_id: scheduled.append(job_id),
+        ),
+    ):
+        first = client.post(
+            f"/auth/documents/{document_id}/translate",
+            json={"target_language": "zh-CN"},
+            cookies={"web_session": "session"},
+        )
+        second = client.post(
+            f"/auth/documents/{document_id}/translate",
+            json={"target_language": "zh-CN"},
+            cookies={"web_session": "session"},
+        )
+
+    assert first.status_code == second.status_code == 202
+    assert first.json()["job_id"] == second.json()["job_id"]
+    assert first.json()["status"] == second.json()["status"] == "pending"
+    assert scheduled == [first.json()["job_id"]]
+
+
+def test_long_translation_runs_after_202_and_polling_survives_refresh(
+    monkeypatch, tmp_path
+):
+    client, user, _ = _build_app(monkeypatch, tmp_path)
+    with patch.object(summary_web, "verify_web_session", return_value=user):
+        document_id = _upload_and_parse(client)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_batch(segments, **_kwargs):
+        started.set()
+        await release.wait()
+        return _translated_batch(segments)
+
+    with (
+        patch.object(translation_web, "_current_user", return_value=user),
+        patch.object(
+            translation_service,
+            "call_deepseek_translation",
+            side_effect=slow_batch,
+        ),
+    ):
+        created = client.post(
+            f"/auth/documents/{document_id}/translate",
+            json={"target_language": "zh-CN"},
+            cookies={"web_session": "session"},
+        )
+        assert created.status_code == 202
+        job_id = created.json()["job_id"]
+        assert created.json()["status"] == "pending"
+
+        async def run_detached_job():
+            task = asyncio.create_task(translation_service.run_translation_job(job_id))
+            await started.wait()
+            processing = translation_service.get_translation_job(user.id, job_id)
+            assert processing["status"] == "processing"
+            assert processing["progress"]["percent"] == 0
+            release.set()
+            await task
+
+        asyncio.run(run_detached_job())
+
+        # A new client represents a refreshed browser; job state is database-backed.
+        refreshed_client = TestClient(client.app)
+        refreshed = refreshed_client.get(
+            f"/auth/documents/translation-jobs/{job_id}",
+            cookies={"web_session": "session"},
+        )
+
+    assert refreshed.status_code == 200
+    assert refreshed.json()["status"] == "completed"
+    assert refreshed.json()["progress"]["percent"] == 100
+    assert refreshed.json()["result"]["translation_id"]
+
+
+def test_translation_job_reports_batch_progress(monkeypatch, tmp_path):
+    client, user, _ = _build_app(monkeypatch, tmp_path)
+    with patch.object(summary_web, "verify_web_session", return_value=user):
+        document_id = _upload_bytes_and_parse(
+            client,
+            _many_paragraph_docx_bytes(),
+            "many-paragraphs.docx",
+        )
+    progress_updates = []
+    original_progress = translation_service._set_translation_job_progress
+
+    def record_progress(job_id, completed, total):
+        progress_updates.append((completed, total))
+        original_progress(job_id, completed, total)
+
+    mocked_ai = AsyncMock(side_effect=_translated_batch)
+    with (
+        patch.object(translation_web, "_current_user", return_value=user),
+        patch.object(translation_service, "call_deepseek_translation", mocked_ai),
+        patch.object(
+            translation_service,
+            "_set_translation_job_progress",
+            side_effect=record_progress,
+        ),
+    ):
+        created = client.post(
+            f"/auth/documents/{document_id}/translate",
+            json={"target_language": "zh-CN"},
+            cookies={"web_session": "session"},
+        )
+        completed = _complete_translation_job(client, created)
+
+    assert progress_updates == [(0, 3), (1, 3), (2, 3), (3, 3)]
+    assert completed["progress"] == {
+        "completed_batches": 3,
+        "total_batches": 3,
+        "percent": 100,
+    }
+
+
+def test_deepseek_failure_is_persisted_on_job(monkeypatch, tmp_path):
+    client, user, _ = _build_app(monkeypatch, tmp_path)
+    with patch.object(summary_web, "verify_web_session", return_value=user):
+        document_id = _upload_and_parse(client)
+    with (
+        patch.object(translation_web, "_current_user", return_value=user),
+        patch.object(
+            translation_service,
+            "call_deepseek_translation",
+            side_effect=translation_service.DocumentTranslationError(
+                "DeepSeek API 网络连接失败，请重试"
+            ),
+        ),
+    ):
+        created = client.post(
+            f"/auth/documents/{document_id}/translate",
+            json={"target_language": "zh-CN"},
+            cookies={"web_session": "session"},
+        )
+        asyncio.run(translation_service.run_translation_job(created.json()["job_id"]))
+        failed = client.get(
+            f"/auth/documents/translation-jobs/{created.json()['job_id']}",
+            cookies={"web_session": "session"},
+        )
+
+    assert failed.status_code == 200
+    assert failed.json()["status"] == "failed"
+    assert failed.json()["error_code"] == "DEEPSEEK_CONNECTION_FAILED"
+    assert failed.json()["message"] == "DeepSeek API 网络连接失败，请重试"
+    assert failed.json()["request_id"]
+
+
+def test_translation_job_timeout_and_status_expiry_cleanup(monkeypatch, tmp_path):
+    client, user, engine = _build_app(monkeypatch, tmp_path)
+    with patch.object(summary_web, "verify_web_session", return_value=user):
+        document_id = _upload_and_parse(client)
+
+    async def never_finishes(_segments, **_kwargs):
+        await asyncio.sleep(1)
+
+    with (
+        patch.object(translation_web, "_current_user", return_value=user),
+        patch.object(
+            translation_service,
+            "call_deepseek_translation",
+            side_effect=never_finishes,
+        ),
+        patch.object(translation_service, "TRANSLATION_JOB_TIMEOUT_SECONDS", 0.01),
+    ):
+        created = client.post(
+            f"/auth/documents/{document_id}/translate",
+            json={"target_language": "zh-CN"},
+            cookies={"web_session": "session"},
+        )
+        job_id = created.json()["job_id"]
+        asyncio.run(translation_service.run_translation_job(job_id))
+        failed = translation_service.get_translation_job(user.id, job_id)
+
+    assert failed["status"] == "failed"
+    assert failed["error_code"] == "TRANSLATION_JOB_TIMEOUT"
+    with engine.connect() as conn:
+        translation_status = conn.execute(
+            select(user_db.document_translations.c.status).where(
+                user_db.document_translations.c.document_id == document_id
+            )
+        ).scalar_one()
+    assert translation_status == "failed"
+    cleanup = translation_service.cleanup_translation_jobs(failed["expires_at"] + 1)
+    assert cleanup["deleted"] == 1
+    with pytest.raises(KeyError, match="不存在或已过期"):
+        translation_service.get_translation_job(user.id, job_id)
 
 
 def test_translation_requires_parsed_owned_document(monkeypatch, tmp_path):
@@ -371,6 +608,117 @@ def test_segmentation_and_batching_uses_configured_segment_count():
     )
     default_batches = list(translation_service.iter_segment_batches(many_segments))
     assert [len(batch) for batch in default_batches] == [20, 20, 5]
+
+
+async def test_blank_numeric_url_and_symbol_segments_bypass_model():
+    segments = [
+        {"segment_id": "blank", "source_text": "   ", "kind": "paragraph"},
+        {"segment_id": "number", "source_text": "1,200.00", "kind": "paragraph"},
+        {
+            "segment_id": "url",
+            "source_text": "https://example.com/path?a=1",
+            "kind": "paragraph",
+        },
+        {"segment_id": "symbols", "source_text": "※ → ★ !!!", "kind": "paragraph"},
+        {
+            "segment_id": "text",
+            "source_text": "Service Agreement",
+            "kind": "heading",
+        },
+    ]
+    requested_ids = []
+
+    async def translate_text_only(requested, **_kwargs):
+        requested_ids.append([item["segment_id"] for item in requested])
+        return "en", [
+            {"segment_id": "text", "translated_text": "服务协议"},
+        ]
+
+    with patch.object(
+        translation_service,
+        "call_deepseek_translation",
+        side_effect=translate_text_only,
+    ):
+        _, translated = await translation_service.translate_batch_with_recovery(
+            segments,
+            source_language="auto",
+            target_language="zh-CN",
+            style="general",
+            glossary=[],
+            user_id="user-id",
+        )
+
+    assert requested_ids == [["text"]]
+    assert translated == [
+        {"segment_id": "number", "translated_text": "1,200.00"},
+        {
+            "segment_id": "url",
+            "translated_text": "https://example.com/path?a=1",
+        },
+        {"segment_id": "symbols", "translated_text": "※ → ★ !!!"},
+        {"segment_id": "text", "translated_text": "服务协议"},
+    ]
+
+
+def test_segment_document_filters_empty_paragraphs():
+    segments = translation_service.segment_document(
+        "\n  \nFirst paragraph.\n\t\nSecond."
+    )
+    assert [item["source_text"] for item in segments] == [
+        "First paragraph.",
+        "Second.",
+    ]
+
+
+def test_missing_and_duplicate_ids_have_structured_diagnostics():
+    segments = translation_service.segment_document("First.\nSecond.")
+    with pytest.raises(
+        translation_service.IncompleteTranslationResponseError
+    ) as missing_error:
+        translation_service._normalize_ai_result(
+            {
+                "translations": [
+                    {
+                        "segment_id": "seg-0001",
+                        "translated_text": "第一段。",
+                    }
+                ]
+            },
+            segments,
+        )
+    assert missing_error.value.expected_count == 2
+    assert missing_error.value.actual_count == 1
+    assert missing_error.value.missing_ids == ["seg-0002"]
+    assert missing_error.value.extra_ids == []
+    assert missing_error.value.duplicate_ids == []
+
+    with pytest.raises(
+        translation_service.IncompleteTranslationResponseError
+    ) as duplicate_error:
+        translation_service._normalize_ai_result(
+            {
+                "translations": [
+                    {
+                        "segment_id": "seg-0001",
+                        "translated_text": "第一段。",
+                    },
+                    {
+                        "segment_id": "seg-0001",
+                        "translated_text": "重复第一段。",
+                    },
+                    {
+                        "segment_id": "seg-extra",
+                        "translated_text": "额外段落。",
+                    },
+                ]
+            },
+            segments,
+        )
+    assert duplicate_error.value.expected_count == 2
+    assert duplicate_error.value.actual_count == 3
+    assert duplicate_error.value.missing_ids == ["seg-0002"]
+    assert duplicate_error.value.extra_ids == ["seg-extra"]
+    assert duplicate_error.value.duplicate_ids == ["seg-0001"]
 
 
 async def test_deepseek_translation_uses_segment_json_and_glossary(monkeypatch):
@@ -439,6 +787,138 @@ async def test_deepseek_translation_uses_segment_json_and_glossary(monkeypatch):
     assert "服务协议" in prompt
     assert "USD 1,200" in prompt
     assert "detected_source_language" not in prompt
+    assert "禁止遗漏、合并、改名、重复、新增或重排" in prompt
+    assert "Markdown" in prompt
+
+
+async def test_incomplete_response_logs_counts_and_ids(monkeypatch, caplog):
+    segments = translation_service.segment_document("First.\nSecond.")
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "translations": [
+                                        {
+                                            "segment_id": "seg-0001",
+                                            "translated_text": "第一段。",
+                                        },
+                                        {
+                                            "segment_id": "seg-extra",
+                                            "translated_text": "额外段落。",
+                                        },
+                                        {
+                                            "segment_id": "seg-0001",
+                                            "translated_text": "重复段落。",
+                                        },
+                                    ]
+                                }
+                            )
+                        },
+                    }
+                ]
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            return FakeResponse()
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    caplog.set_level(logging.WARNING, logger=translation_service.__name__)
+    with (
+        patch.object(
+            translation_service.httpx, "AsyncClient", return_value=FakeClient()
+        ),
+        pytest.raises(translation_service.IncompleteTranslationResponseError),
+    ):
+        await translation_service.call_deepseek_translation(
+            segments,
+            source_language="auto",
+            target_language="zh-CN",
+            style="general",
+            glossary=[],
+            user_id="user-id",
+            request_id="request-id",
+            batch_index=1,
+        )
+
+    log_text = caplog.text
+    assert "expected_count=2" in log_text
+    assert "actual_count=3" in log_text
+    assert 'missing_ids=["seg-0002"]' in log_text
+    assert 'extra_ids=["seg-extra"]' in log_text
+    assert 'duplicate_ids=["seg-0001"]' in log_text
+    assert "First." not in log_text
+    assert "第一段。" not in log_text
+
+
+async def test_invalid_json_is_logged_without_response_content(monkeypatch, caplog):
+    segments = translation_service.segment_document("Service Agreement")
+    invalid_content = "```json not valid ```"
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": invalid_content},
+                    }
+                ]
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            return FakeResponse()
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    caplog.set_level(logging.WARNING, logger=translation_service.__name__)
+    with (
+        patch.object(
+            translation_service.httpx, "AsyncClient", return_value=FakeClient()
+        ),
+        pytest.raises(translation_service.InvalidTranslationResponseError),
+    ):
+        await translation_service.call_deepseek_translation(
+            segments,
+            source_language="auto",
+            target_language="zh-CN",
+            style="general",
+            glossary=[],
+            user_id="user-id",
+            request_id="request-id",
+        )
+
+    assert "reason=invalid_json" in caplog.text
+    assert "json_error_position=" in caplog.text
+    assert invalid_content not in caplog.text
 
 
 async def test_incomplete_translation_retries_current_batch():
@@ -497,15 +977,27 @@ async def test_incomplete_translation_retries_current_batch():
     ]
 
 
-async def test_invalid_translation_response_splits_batch_and_retries():
+async def test_duplicate_id_response_splits_batch_and_retries():
     segments = translation_service.segment_document("Heading\nFirst paragraph.")
     requested_sizes = []
 
     async def invalid_batch(requested, **_kwargs):
         requested_sizes.append(len(requested))
         if len(requested) > 1:
-            raise translation_service.InvalidTranslationResponseError(
-                "AI 返回的翻译格式无效"
+            return translation_service._normalize_ai_result(
+                {
+                    "translations": [
+                        {
+                            "segment_id": requested[0]["segment_id"],
+                            "translated_text": "重复一",
+                        },
+                        {
+                            "segment_id": requested[0]["segment_id"],
+                            "translated_text": "重复二",
+                        },
+                    ]
+                },
+                requested,
             )
         return "en", [
             {
@@ -532,11 +1024,12 @@ async def test_invalid_translation_response_splits_batch_and_retries():
     assert [item["segment_id"] for item in translated] == ["seg-0001", "seg-0002"]
 
 
-async def test_single_incomplete_segment_has_bounded_retries():
+async def test_single_incomplete_segment_has_bounded_retries(caplog):
     segments = translation_service.segment_document("Only one paragraph.")
     mocked_ai = AsyncMock(
         side_effect=translation_service.IncompleteTranslationResponseError([], "en")
     )
+    caplog.set_level(logging.ERROR, logger=translation_service.__name__)
     with (
         patch.object(translation_service, "call_deepseek_translation", mocked_ai),
         pytest.raises(
@@ -554,6 +1047,58 @@ async def test_single_incomplete_segment_has_bounded_retries():
         )
 
     assert mocked_ai.await_count == translation_service.TRANSLATION_BATCH_RETRIES + 1
+    assert "failed_segment_id=seg-0001" in caplog.text
+
+
+async def test_incomplete_twenty_segment_batch_bisects_to_singletons_in_order():
+    segments = translation_service.segment_document(
+        "\n".join(f"Paragraph {index}." for index in range(20))
+    )
+    requested_batches = []
+
+    async def incomplete_until_single(requested, **_kwargs):
+        requested_batches.append(tuple(item["segment_id"] for item in requested))
+        if len(requested) > 1:
+            return translation_service._normalize_ai_result(
+                {
+                    "translations": [
+                        {
+                            "segment_id": item["segment_id"],
+                            "translated_text": f"译文 {item['segment_id']}",
+                        }
+                        for item in requested[:-1]
+                    ]
+                },
+                requested,
+            )
+        return None, [
+            {
+                "segment_id": requested[0]["segment_id"],
+                "translated_text": f"译文 {requested[0]['segment_id']}",
+            }
+        ]
+
+    with patch.object(
+        translation_service,
+        "call_deepseek_translation",
+        side_effect=incomplete_until_single,
+    ):
+        _, translated = await translation_service.translate_batch_with_recovery(
+            segments,
+            source_language="auto",
+            target_language="zh-CN",
+            style="general",
+            glossary=[],
+            user_id="user-id",
+        )
+
+    requested_sizes = [len(batch) for batch in requested_batches]
+    for expected_size in (20, 10, 5, 2, 1):
+        assert expected_size in requested_sizes
+    assert max(Counter(requested_batches).values()) == 3
+    assert [item["segment_id"] for item in translated] == [
+        item["segment_id"] for item in segments
+    ]
 
 
 async def test_length_finish_reason_is_retried_then_split_in_original_order():

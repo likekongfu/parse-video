@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import html
 import io
@@ -12,16 +13,17 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import httpx
 from docx import Document
-from sqlalchemy import and_, insert, or_, select, update
+from sqlalchemy import and_, delete, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from parse_video_py.document_summary import get_owned_document
 from parse_video_py.user_db import (
     _engine,
+    document_translation_jobs,
     document_translations,
     init_user_database,
 )
@@ -30,6 +32,15 @@ PROCESSING_STALE_SECONDS = 10 * 60
 TRANSLATION_BATCH_SIZE = max(1, int(os.getenv("TRANSLATION_BATCH_SIZE", "20")))
 TRANSLATION_BATCH_RETRIES = 2
 TRANSLATION_PIPELINE_VERSION = "pdf-layout-v1"
+TRANSLATION_JOB_TIMEOUT_SECONDS = max(
+    30, int(os.getenv("TRANSLATION_JOB_TIMEOUT_SECONDS", "1800"))
+)
+TRANSLATION_JOB_TTL_SECONDS = max(
+    60, int(os.getenv("TRANSLATION_JOB_TTL_SECONDS", "7200"))
+)
+TRANSLATION_JOB_CLEANUP_INTERVAL_SECONDS = max(
+    10, int(os.getenv("TRANSLATION_JOB_CLEANUP_INTERVAL_SECONDS", "60"))
+)
 PDF_TRANSLATION_MIN_SCALE = min(
     1.0, max(0.25, float(os.getenv("PDF_TRANSLATION_MIN_SCALE", "0.50")))
 )
@@ -49,6 +60,8 @@ STYLE_LABELS = {
 }
 _LANGUAGE_CODE = re.compile(r"^[A-Za-z][A-Za-z0-9-]{0,15}$")
 logger = logging.getLogger(__name__)
+_background_jobs: set[asyncio.Task[None]] = set()
+_cleanup_task: asyncio.Task[None] | None = None
 
 
 class DocumentTranslationError(RuntimeError):
@@ -62,9 +75,18 @@ class DocumentTranslationBusyError(DocumentTranslationError):
 class InvalidTranslationResponseError(DocumentTranslationError):
     """The model response cannot be decoded as a translation payload."""
 
-    def __init__(self, message: str, *, finish_reason: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        finish_reason: str | None = None,
+        expected_count: int | None = None,
+        actual_count: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.finish_reason = finish_reason
+        self.expected_count = expected_count
+        self.actual_count = actual_count
 
 
 class TruncatedTranslationResponseError(InvalidTranslationResponseError):
@@ -80,11 +102,21 @@ class IncompleteTranslationResponseError(DocumentTranslationError):
         detected_source_language: str | None,
         *,
         finish_reason: str | None = None,
+        expected_count: int | None = None,
+        actual_count: int | None = None,
+        missing_ids: list[str] | None = None,
+        extra_ids: list[str] | None = None,
+        duplicate_ids: list[str] | None = None,
     ) -> None:
         super().__init__("AI 返回的翻译段落不完整")
         self.translated = translated
         self.detected_source_language = detected_source_language
         self.finish_reason = finish_reason
+        self.expected_count = expected_count
+        self.actual_count = actual_count
+        self.missing_ids = missing_ids or []
+        self.extra_ids = extra_ids or []
+        self.duplicate_ids = duplicate_ids or []
 
 
 def normalize_glossary(value: Any) -> list[dict[str, str]]:
@@ -283,33 +315,99 @@ def iter_segment_batches(
         yield segments[offset : offset + batch_size]
 
 
+_URL_ONLY = re.compile(r"^(?:https?://|www\.)\S+$", re.IGNORECASE)
+_EMAIL_ONLY = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+_NUMERIC_ONLY = re.compile(r"^[\d\s.,，。:：;；+\-−–—/%％‰()（）\[\]{}￥¥$€£]+$")
+
+
+def segment_requires_translation(segment: dict[str, Any]) -> bool:
+    """Return False for content that must be preserved without calling the model."""
+    text = str(segment.get("source_text") or "").strip()
+    if not text:
+        return False
+    if (
+        _URL_ONLY.fullmatch(text)
+        or _EMAIL_ONLY.fullmatch(text)
+        or _NUMERIC_ONLY.fullmatch(text)
+    ):
+        return False
+    # isalpha() covers letters across supported scripts without classifying digits
+    # and underscore as translatable content.
+    return any(character.isalpha() for character in text)
+
+
+def _passthrough_translation(segment: dict[str, Any]) -> dict[str, str]:
+    return {
+        "segment_id": str(segment["segment_id"]),
+        "translated_text": str(segment.get("source_text") or ""),
+    }
+
+
 def _normalize_ai_result(
     payload: Any, expected_segments: list[dict[str, str]]
 ) -> tuple[str | None, list[dict[str, str]]]:
+    expected_count = len(expected_segments)
     if not isinstance(payload, dict) or not isinstance(
         payload.get("translations"), list
     ):
-        raise InvalidTranslationResponseError("AI 返回的翻译格式无效")
+        raise InvalidTranslationResponseError(
+            "AI 返回的翻译格式无效",
+            expected_count=expected_count,
+            actual_count=None,
+        )
     expected_ids = [item["segment_id"] for item in expected_segments]
+    expected_id_set = set(expected_ids)
+    response_items = payload["translations"]
+    actual_count = len(response_items)
     translated: dict[str, str] = {}
-    for item in payload["translations"]:
+    response_ids: list[str] = []
+    invalid_item = False
+    for item in response_items:
         if not isinstance(item, dict):
-            raise InvalidTranslationResponseError("AI 返回的翻译格式无效")
+            invalid_item = True
+            continue
         segment_id = str(item.get("segment_id") or "")
         text = str(item.get("translated_text") or "").strip()
-        # Ignore hallucinated/duplicate entries. Required IDs are still checked below,
-        # and only expected translations are ever persisted.
-        if segment_id in translated or segment_id not in expected_ids or not text:
+        response_ids.append(segment_id)
+        if segment_id in translated or segment_id not in expected_id_set or not text:
             continue
         translated[segment_id] = text
     detected = str(payload.get("detected_source_language") or "").strip() or None
-    if set(translated) != set(expected_ids):
+    id_counts = {
+        segment_id: response_ids.count(segment_id) for segment_id in response_ids
+    }
+    duplicate_ids = sorted(
+        segment_id
+        for segment_id, count in id_counts.items()
+        if segment_id and count > 1
+    )
+    extra_ids = sorted(
+        {segment_id for segment_id in response_ids if segment_id not in expected_id_set}
+    )
+    missing_ids = [
+        segment_id for segment_id in expected_ids if segment_id not in translated
+    ]
+    if (
+        invalid_item
+        or missing_ids
+        or extra_ids
+        or duplicate_ids
+        or actual_count != expected_count
+    ):
         partial = [
             {"segment_id": segment_id, "translated_text": translated[segment_id]}
             for segment_id in expected_ids
             if segment_id in translated
         ]
-        raise IncompleteTranslationResponseError(partial, detected)
+        raise IncompleteTranslationResponseError(
+            partial,
+            detected,
+            expected_count=expected_count,
+            actual_count=actual_count,
+            missing_ids=missing_ids,
+            extra_ids=extra_ids,
+            duplicate_ids=duplicate_ids,
+        )
     return detected, [
         {"segment_id": segment_id, "translated_text": translated[segment_id]}
         for segment_id in expected_ids
@@ -345,13 +443,17 @@ async def call_deepseek_translation(
         }
         for item in segments
     ]
+    required_ids = [item["segment_id"] for item in segments]
     prompt = (
         f"将以下文档段落翻译为 {target_language}。{source_instruction}。"
         f"风格要求：{STYLE_LABELS[style]}。一次处理的是完整标题和段落，禁止拆成逐句结果。"
-        "必须保持输入段落顺序和 segment_id，不得合并、遗漏或新增段落。"
+        f"输入共有 {len(required_ids)} 个 segment。必须为每个输入 segment_id 返回且只返回一项。"
+        "禁止遗漏、合并、改名、重复、新增或重排 segment_id；即使译文与原文相同也必须返回。"
+        f"必须严格按以下顺序返回 segment_id："
+        f"{json.dumps(required_ids, ensure_ascii=False, separators=(',', ':'))}。"
         "原样保留编号、金额、货币、日期、计量单位、网址、邮箱、代码和无法确定的专有名词。"
-        "优先严格使用术语表。只输出 JSON，不要 Markdown。"
-        "每个返回项只能包含 segment_id 和 translated_text。"
+        "优先严格使用术语表。只能输出一个合法 JSON 对象，禁止 Markdown、代码块、解释或说明文字。"
+        "顶层只能包含 translations；每个返回项只能包含 segment_id 和 translated_text。"
         'JSON 格式为 {"translations":[{"segment_id":"seg-0001",'
         '"translated_text":"..."}]}。\n'
         f"术语表：{glossary_text}\n"
@@ -362,7 +464,10 @@ async def call_deepseek_translation(
         "messages": [
             {
                 "role": "system",
-                "content": "你是专业文档翻译引擎，只返回严格有效的 JSON。",
+                "content": (
+                    "你是专业文档翻译引擎。输出必须是严格有效的 JSON，"
+                    "不得输出 Markdown、代码围栏、自然语言说明或任何 JSON 之外的字符。"
+                ),
             },
             {"role": "user", "content": prompt},
         ],
@@ -402,13 +507,56 @@ async def call_deepseek_translation(
             return _normalize_ai_result(payload, segments)
         except IncompleteTranslationResponseError as exc:
             exc.finish_reason = finish_reason
+            logger.warning(
+                "translation_response_validation_failed request_id=%s batch_index=%d "
+                "attempt=%d finish_reason=%s expected_count=%d actual_count=%d "
+                "missing_ids=%s extra_ids=%s duplicate_ids=%s",
+                request_id,
+                batch_index,
+                attempt,
+                finish_reason,
+                exc.expected_count,
+                exc.actual_count,
+                json.dumps(exc.missing_ids, ensure_ascii=True),
+                json.dumps(exc.extra_ids, ensure_ascii=True),
+                json.dumps(exc.duplicate_ids, ensure_ascii=True),
+            )
             raise
         except InvalidTranslationResponseError as exc:
             exc.finish_reason = finish_reason
+            logger.warning(
+                "translation_response_validation_failed request_id=%s batch_index=%d "
+                "attempt=%d finish_reason=%s expected_count=%s actual_count=%s "
+                "missing_ids=[] extra_ids=[] duplicate_ids=[] reason=invalid_schema",
+                request_id,
+                batch_index,
+                attempt,
+                finish_reason,
+                exc.expected_count,
+                exc.actual_count,
+            )
             raise
         except json.JSONDecodeError as exc:
+            logger.warning(
+                "translation_response_validation_failed request_id=%s batch_index=%d "
+                "attempt=%d finish_reason=%s expected_count=%d actual_count=unknown "
+                "missing_ids=%s extra_ids=[] duplicate_ids=[] reason=invalid_json "
+                "json_error_line=%d json_error_column=%d json_error_position=%d",
+                request_id,
+                batch_index,
+                attempt,
+                finish_reason,
+                len(segments),
+                json.dumps(required_ids, ensure_ascii=True),
+                exc.lineno,
+                exc.colno,
+                exc.pos,
+            )
             raise InvalidTranslationResponseError(
-                "AI 返回的翻译 JSON 无效", finish_reason=finish_reason
+                "AI 返回的翻译 JSON 无效",
+                finish_reason=finish_reason,
+                expected_count=len(segments),
+                actual_count=None,
             ) from exc
     except httpx.TimeoutException as exc:
         logger.warning(
@@ -444,7 +592,21 @@ async def call_deepseek_translation(
         )
         raise DocumentTranslationError("DeepSeek API 网络连接失败，请重试") from exc
     except (KeyError, IndexError, TypeError) as exc:
-        raise InvalidTranslationResponseError("AI 返回的翻译格式无效") from exc
+        logger.warning(
+            "translation_response_validation_failed request_id=%s batch_index=%d "
+            "attempt=%d finish_reason=unknown expected_count=%d actual_count=unknown "
+            "missing_ids=%s extra_ids=[] duplicate_ids=[] reason=invalid_schema",
+            request_id,
+            batch_index,
+            attempt,
+            len(segments),
+            json.dumps(required_ids, ensure_ascii=True),
+        )
+        raise InvalidTranslationResponseError(
+            "AI 返回的翻译格式无效",
+            expected_count=len(segments),
+            actual_count=None,
+        ) from exc
 
 
 async def translate_batch_with_recovery(
@@ -461,15 +623,44 @@ async def translate_batch_with_recovery(
     split_depth: int = 0,
 ) -> tuple[str | None, list[dict[str, str]]]:
     """Retry a batch at most twice, then bisect it until a clear singleton error."""
-    if not segments:
+    ordered_segments = [
+        segment for segment in segments if str(segment.get("source_text") or "").strip()
+    ]
+    if not ordered_segments:
         return None, []
+    passthrough_by_id = {
+        str(segment["segment_id"]): _passthrough_translation(segment)
+        for segment in ordered_segments
+        if not segment_requires_translation(segment)
+    }
+    model_segments = [
+        segment for segment in ordered_segments if segment_requires_translation(segment)
+    ]
+    logger.debug(
+        "translation_batch_prepared request_id=%s batch_index=%d input_count=%d "
+        "filtered_blank_count=%d passthrough_count=%d model_count=%d split_depth=%d",
+        request_id,
+        batch_index,
+        len(segments),
+        len(segments) - len(ordered_segments),
+        len(passthrough_by_id),
+        len(model_segments),
+        split_depth,
+    )
+    if not model_segments:
+        return None, [
+            passthrough_by_id[str(segment["segment_id"])]
+            for segment in ordered_segments
+        ]
+
+    retry_limit = min(TRANSLATION_BATCH_RETRIES, max(0, max_retries))
     last_error: (
         InvalidTranslationResponseError | IncompleteTranslationResponseError | None
     ) = None
-    for attempt in range(max_retries + 1):
+    for attempt in range(retry_limit + 1):
         try:
-            return await call_deepseek_translation(
-                segments,
+            detected, translated = await call_deepseek_translation(
+                model_segments,
                 source_language=source_language,
                 target_language=target_language,
                 style=style,
@@ -479,6 +670,13 @@ async def translate_batch_with_recovery(
                 batch_index=batch_index,
                 attempt=attempt,
             )
+            translated_by_id = {
+                item["segment_id"]: item for item in translated
+            } | passthrough_by_id
+            return detected, [
+                translated_by_id[str(segment["segment_id"])]
+                for segment in ordered_segments
+            ]
         except (
             InvalidTranslationResponseError,
             IncompleteTranslationResponseError,
@@ -486,35 +684,55 @@ async def translate_batch_with_recovery(
             last_error = exc
             logger.warning(
                 "translation_batch_retry request_id=%s batch_index=%d "
-                "segment_count=%d attempt=%d finish_reason=%s split_depth=%d reason=%s",
+                "segment_count=%d attempt=%d finish_reason=%s split_depth=%d reason=%s "
+                "expected_count=%s actual_count=%s missing_ids=%s extra_ids=%s "
+                "duplicate_ids=%s",
                 request_id,
                 batch_index,
-                len(segments),
+                len(model_segments),
                 attempt,
                 getattr(exc, "finish_reason", None) or "unknown",
                 split_depth,
                 type(exc).__name__,
+                getattr(exc, "expected_count", None),
+                getattr(exc, "actual_count", None),
+                json.dumps(getattr(exc, "missing_ids", []), ensure_ascii=True),
+                json.dumps(getattr(exc, "extra_ids", []), ensure_ascii=True),
+                json.dumps(getattr(exc, "duplicate_ids", []), ensure_ascii=True),
             )
 
-    if len(segments) == 1:
-        segment_id = segments[0]["segment_id"]
+    if len(model_segments) == 1:
+        segment_id = model_segments[0]["segment_id"]
+        logger.error(
+            "translation_segment_failed request_id=%s batch_index=%d "
+            "failed_segment_id=%s retry_count=%d split_depth=%d reason=%s",
+            request_id,
+            batch_index,
+            segment_id,
+            retry_limit,
+            split_depth,
+            type(last_error).__name__ if last_error else "unknown",
+        )
         raise DocumentTranslationError(
             f"段落 {segment_id} 翻译失败：AI 返回内容无效或不完整"
         ) from last_error
 
-    midpoint = len(segments) // 2
+    midpoint = len(model_segments) // 2
     logger.warning(
         "translation_batch_split request_id=%s batch_index=%d segment_count=%d "
         "finish_reason=%s split_depth=%d",
         request_id,
         batch_index,
-        len(segments),
+        len(model_segments),
         getattr(last_error, "finish_reason", None) or "unknown",
         split_depth,
     )
     detected_language: str | None = None
-    translated_by_id: dict[str, str] = {}
-    for smaller_batch in (segments[:midpoint], segments[midpoint:]):
+    translated_by_id: dict[str, dict[str, str]] = dict(passthrough_by_id)
+    for smaller_batch in (
+        model_segments[:midpoint],
+        model_segments[midpoint:],
+    ):
         detected, translated = await translate_batch_with_recovery(
             smaller_batch,
             source_language=source_language,
@@ -528,15 +746,9 @@ async def translate_batch_with_recovery(
             split_depth=split_depth + 1,
         )
         detected_language = detected_language or detected
-        translated_by_id.update(
-            (item["segment_id"], item["translated_text"]) for item in translated
-        )
+        translated_by_id.update((item["segment_id"], item) for item in translated)
     return detected_language, [
-        {
-            "segment_id": segment["segment_id"],
-            "translated_text": translated_by_id[segment["segment_id"]],
-        }
-        for segment in segments
+        translated_by_id[str(segment["segment_id"])] for segment in ordered_segments
     ]
 
 
@@ -656,6 +868,8 @@ async def translate_document(
     mode: str = "translation",
     style: str = "general",
     glossary: Any = None,
+    request_id: str | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> dict[str, Any]:
     document = get_owned_document(user_id, document_id)
     if document["extraction_status"] != "completed" or not document["extracted_text"]:
@@ -669,13 +883,15 @@ async def translate_document(
     )
     task, cached = _acquire_translation(user_id, document_id, options)
     if cached:
+        if progress_callback:
+            progress_callback(1, 1)
         return {
             "document_id": document_id,
             "translation_id": task["id"],
             **json.loads(task["result_json"]),
             "cached": True,
         }
-    request_id = uuid.uuid4().hex
+    request_id = request_id or uuid.uuid4().hex
     try:
         if document.get("file_type") == "pdf":
             segments = segment_pdf_document(Path(document["storage_path"]))
@@ -685,6 +901,8 @@ async def translate_document(
         detected_language: str | None = None
         resolved_source = options["source_language"]
         batches = list(iter_segment_batches(segments))
+        if progress_callback:
+            progress_callback(0, len(batches))
         logger.info(
             "translation_started request_id=%s document_id=%s segment_count=%d batch_count=%d",
             request_id,
@@ -710,6 +928,8 @@ async def translate_document(
             translated_by_id.update(
                 (item["segment_id"], item["translated_text"]) for item in translated
             )
+            if progress_callback:
+                progress_callback(batch_index, len(batches))
         result_segments = [
             {**segment, "translated_text": translated_by_id[segment["segment_id"]]}
             for segment in segments
@@ -749,6 +969,394 @@ async def translate_document(
         error = "文档翻译失败，请重试"
         _finish_translation(task["id"], user_id, error=error)
         raise DocumentTranslationError(error) from exc
+
+
+def _translation_job_row(job_id: str, user_id: str | None = None):
+    statement = select(document_translation_jobs).where(
+        document_translation_jobs.c.id == job_id
+    )
+    if user_id is not None:
+        statement = statement.where(document_translation_jobs.c.user_id == user_id)
+    with _engine.connect() as conn:
+        return conn.execute(statement).mappings().first()
+
+
+def cleanup_translation_jobs(now: int | None = None) -> dict[str, int]:
+    """Expire abandoned jobs and delete terminal job status after its TTL."""
+    init_user_database()
+    current_time = int(time.time()) if now is None else now
+    stale_before = current_time - TRANSLATION_JOB_TIMEOUT_SECONDS
+    with _engine.begin() as conn:
+        expired_running = conn.execute(
+            update(document_translation_jobs)
+            .where(
+                document_translation_jobs.c.status.in_(("pending", "processing")),
+                document_translation_jobs.c.updated_at < stale_before,
+            )
+            .values(
+                status="failed",
+                error_code="TRANSLATION_JOB_TIMEOUT",
+                error_message="文档翻译任务执行超时，请重新提交",
+                completed_at=current_time,
+                updated_at=current_time,
+                expires_at=current_time + TRANSLATION_JOB_TTL_SECONDS,
+            )
+        ).rowcount
+        deleted = conn.execute(
+            delete(document_translation_jobs).where(
+                document_translation_jobs.c.status.in_(("completed", "failed")),
+                document_translation_jobs.c.expires_at <= current_time,
+            )
+        ).rowcount
+    return {"expired": expired_running, "deleted": deleted}
+
+
+def _job_progress(row: dict[str, Any]) -> dict[str, int]:
+    total = max(0, int(row.get("total_batches") or 0))
+    completed = min(total, max(0, int(row.get("completed_batches") or 0)))
+    percent = (
+        100
+        if row.get("status") == "completed"
+        else (round(completed * 100 / total) if total else 0)
+    )
+    return {
+        "completed_batches": completed,
+        "total_batches": total,
+        "percent": percent,
+    }
+
+
+def _translation_job_response(row: dict[str, Any]) -> dict[str, Any]:
+    response: dict[str, Any] = {
+        "job_id": row["id"],
+        "document_id": row["document_id"],
+        "status": row["status"],
+        "progress": _job_progress(row),
+        "request_id": row["request_id"],
+        "error_code": row.get("error_code"),
+        "message": row.get("error_message"),
+        "expires_at": row["expires_at"],
+    }
+    if row["status"] == "completed" and row.get("translation_id"):
+        _, result = get_translation(
+            row["user_id"], row["document_id"], row["translation_id"]
+        )
+        response["result"] = {
+            "document_id": row["document_id"],
+            "translation_id": row["translation_id"],
+            **result,
+            "cached": bool(row.get("cached")),
+        }
+    return response
+
+
+def create_translation_job(
+    user_id: str,
+    document_id: str,
+    *,
+    source_language: str = "auto",
+    target_language: str,
+    mode: str = "translation",
+    style: str = "general",
+    glossary: Any = None,
+) -> tuple[dict[str, Any], bool]:
+    """Create or reuse one persistent job for a document/options combination."""
+    document = get_owned_document(user_id, document_id)
+    if document["extraction_status"] != "completed" or not document["extracted_text"]:
+        raise DocumentTranslationError("请先完成文档解析")
+    options = normalize_options(
+        source_language=source_language,
+        target_language=target_language,
+        mode=mode,
+        style=style,
+        glossary=glossary,
+    )
+    segments = (
+        segment_pdf_document(Path(document["storage_path"]))
+        if document.get("file_type") == "pdf"
+        else segment_document(document["extracted_text"])
+    )
+    total_batches = max(1, len(list(iter_segment_batches(segments))))
+    options_hash = _options_hash(options)
+    options_json = json.dumps(options, ensure_ascii=False, separators=(",", ":"))
+    now = int(time.time())
+    cleanup_translation_jobs(now)
+
+    with _engine.connect() as conn:
+        existing = (
+            conn.execute(
+                select(document_translation_jobs).where(
+                    document_translation_jobs.c.document_id == document_id,
+                    document_translation_jobs.c.user_id == user_id,
+                    document_translation_jobs.c.options_hash == options_hash,
+                )
+            )
+            .mappings()
+            .first()
+        )
+    if existing and existing["status"] in ("pending", "processing", "completed"):
+        return _translation_job_response(dict(existing)), False
+
+    request_id = uuid.uuid4().hex
+    values = {
+        "id": existing["id"] if existing else str(uuid.uuid4()),
+        "document_id": document_id,
+        "user_id": user_id,
+        "options_hash": options_hash,
+        "options_json": options_json,
+        "translation_id": None,
+        "request_id": request_id,
+        "status": "pending",
+        "completed_batches": 0,
+        "total_batches": total_batches,
+        "cached": 0,
+        "error_code": None,
+        "error_message": None,
+        "created_at": now,
+        "started_at": None,
+        "updated_at": now,
+        "completed_at": None,
+        "expires_at": now
+        + TRANSLATION_JOB_TIMEOUT_SECONDS
+        + TRANSLATION_JOB_TTL_SECONDS,
+    }
+    try:
+        with _engine.begin() as conn:
+            if existing:
+                conn.execute(
+                    update(document_translation_jobs)
+                    .where(document_translation_jobs.c.id == existing["id"])
+                    .values(
+                        **{key: value for key, value in values.items() if key != "id"}
+                    )
+                )
+            else:
+                conn.execute(insert(document_translation_jobs).values(**values))
+    except IntegrityError:
+        with _engine.connect() as conn:
+            winner = (
+                conn.execute(
+                    select(document_translation_jobs).where(
+                        document_translation_jobs.c.document_id == document_id,
+                        document_translation_jobs.c.user_id == user_id,
+                        document_translation_jobs.c.options_hash == options_hash,
+                    )
+                )
+                .mappings()
+                .first()
+            )
+        if not winner:
+            raise
+        return _translation_job_response(dict(winner)), False
+    row = _translation_job_row(values["id"], user_id)
+    return _translation_job_response(dict(row)), True
+
+
+def get_translation_job(user_id: str, job_id: str) -> dict[str, Any]:
+    cleanup_translation_jobs()
+    row = _translation_job_row(job_id, user_id)
+    if not row:
+        raise KeyError("翻译任务不存在或已过期")
+    return _translation_job_response(dict(row))
+
+
+def _set_translation_job_progress(job_id: str, completed: int, total: int) -> None:
+    now = int(time.time())
+    with _engine.begin() as conn:
+        conn.execute(
+            update(document_translation_jobs)
+            .where(
+                document_translation_jobs.c.id == job_id,
+                document_translation_jobs.c.status == "processing",
+            )
+            .values(
+                completed_batches=max(0, completed),
+                total_batches=max(1, total),
+                updated_at=now,
+            )
+        )
+
+
+def _translation_job_error_code(exc: Exception) -> str:
+    message = str(exc)
+    if "超时" in message:
+        return "DEEPSEEK_TIMEOUT"
+    if "网络连接" in message:
+        return "DEEPSEEK_CONNECTION_FAILED"
+    if "DeepSeek API 请求失败" in message:
+        return "DEEPSEEK_HTTP_ERROR"
+    if "AI 返回" in message or "翻译失败" in message:
+        return "TRANSLATION_RESPONSE_INVALID"
+    return "TRANSLATION_FAILED"
+
+
+def _fail_translation_job(
+    job_id: str, *, error_code: str, message: str, request_id: str
+) -> None:
+    now = int(time.time())
+    logger.error(
+        "translation_job_failed job_id=%s request_id=%s error_code=%s message=%s",
+        job_id,
+        request_id,
+        error_code,
+        message,
+    )
+    job_row = _translation_job_row(job_id)
+    with _engine.begin() as conn:
+        conn.execute(
+            update(document_translation_jobs)
+            .where(document_translation_jobs.c.id == job_id)
+            .values(
+                status="failed",
+                error_code=error_code,
+                error_message=message[:1000],
+                completed_at=now,
+                updated_at=now,
+                expires_at=now + TRANSLATION_JOB_TTL_SECONDS,
+            )
+        )
+        if job_row:
+            # asyncio timeout / cancellation can interrupt translate_document before
+            # it marks its cache row failed. Release that row so a retry can start.
+            conn.execute(
+                update(document_translations)
+                .where(
+                    document_translations.c.document_id == job_row["document_id"],
+                    document_translations.c.user_id == job_row["user_id"],
+                    document_translations.c.options_hash == job_row["options_hash"],
+                    document_translations.c.status == "processing",
+                )
+                .values(
+                    status="failed",
+                    error_message=message[:1000],
+                    updated_at=now,
+                )
+            )
+
+
+async def run_translation_job(job_id: str) -> None:
+    """Claim and execute one job; every failure is persisted and contained."""
+    row = _translation_job_row(job_id)
+    if not row:
+        return
+    now = int(time.time())
+    with _engine.begin() as conn:
+        claimed = conn.execute(
+            update(document_translation_jobs)
+            .where(
+                document_translation_jobs.c.id == job_id,
+                document_translation_jobs.c.status == "pending",
+            )
+            .values(status="processing", started_at=now, updated_at=now)
+        )
+    if claimed.rowcount != 1:
+        return
+
+    row = dict(_translation_job_row(job_id))
+    request_id = row["request_id"]
+    try:
+        options = json.loads(row["options_json"])
+        result = await asyncio.wait_for(
+            translate_document(
+                row["user_id"],
+                row["document_id"],
+                source_language=options["source_language"],
+                target_language=options["target_language"],
+                mode=options["mode"],
+                style=options["style"],
+                glossary=options["glossary"],
+                request_id=request_id,
+                progress_callback=lambda completed, total: _set_translation_job_progress(
+                    job_id, completed, total
+                ),
+            ),
+            timeout=TRANSLATION_JOB_TIMEOUT_SECONDS,
+        )
+        finished_at = int(time.time())
+        current = dict(_translation_job_row(job_id))
+        total_batches = max(1, int(current.get("total_batches") or 1))
+        with _engine.begin() as conn:
+            conn.execute(
+                update(document_translation_jobs)
+                .where(document_translation_jobs.c.id == job_id)
+                .values(
+                    status="completed",
+                    translation_id=result["translation_id"],
+                    completed_batches=total_batches,
+                    total_batches=total_batches,
+                    cached=1 if result.get("cached") else 0,
+                    error_code=None,
+                    error_message=None,
+                    completed_at=finished_at,
+                    updated_at=finished_at,
+                    expires_at=finished_at + TRANSLATION_JOB_TTL_SECONDS,
+                )
+            )
+    except asyncio.TimeoutError:
+        _fail_translation_job(
+            job_id,
+            error_code="TRANSLATION_JOB_TIMEOUT",
+            message="文档翻译任务执行超时，请重新提交",
+            request_id=request_id,
+        )
+    except asyncio.CancelledError:
+        _fail_translation_job(
+            job_id,
+            error_code="TRANSLATION_JOB_CANCELLED",
+            message="文档翻译任务已中止，请重新提交",
+            request_id=request_id,
+        )
+        raise
+    except DocumentTranslationError as exc:
+        _fail_translation_job(
+            job_id,
+            error_code=_translation_job_error_code(exc),
+            message=str(exc),
+            request_id=request_id,
+        )
+    except Exception as exc:
+        logger.exception(
+            "translation_job_unhandled_error job_id=%s request_id=%s",
+            job_id,
+            request_id,
+        )
+        _fail_translation_job(
+            job_id,
+            error_code="TRANSLATION_INTERNAL_ERROR",
+            message="文档翻译任务执行失败，请稍后重试",
+            request_id=request_id,
+        )
+
+
+async def _translation_job_cleanup_loop() -> None:
+    try:
+        while True:
+            await asyncio.sleep(TRANSLATION_JOB_CLEANUP_INTERVAL_SECONDS)
+            try:
+                cleanup_translation_jobs()
+            except Exception:
+                logger.exception("translation_job_cleanup_failed")
+    except asyncio.CancelledError:
+        return
+
+
+def _discard_background_job(task: asyncio.Task[None]) -> None:
+    _background_jobs.discard(task)
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except Exception:
+        logger.exception("translation_background_task_escaped")
+
+
+def schedule_translation_job(job_id: str) -> None:
+    global _cleanup_task
+    task = asyncio.create_task(run_translation_job(job_id))
+    _background_jobs.add(task)
+    task.add_done_callback(_discard_background_job)
+    if _cleanup_task is None or _cleanup_task.done():
+        _cleanup_task = asyncio.create_task(_translation_job_cleanup_loop())
 
 
 def get_translation(

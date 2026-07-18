@@ -257,8 +257,28 @@ DEEPSEEK_TIMEOUT_SECONDS=120
 DEEPSEEK_MAX_INPUT_CHARS=100000
 TRANSLATION_BATCH_SIZE=20
 PDF_TRANSLATION_MIN_SCALE=0.50
+TRANSLATION_JOB_TIMEOUT_SECONDS=1800
+TRANSLATION_JOB_TTL_SECONDS=7200
+TRANSLATION_JOB_CLEANUP_INTERVAL_SECONDS=60
 DOCUMENT_SUMMARY_UPLOAD_DIR=/app/data/document-summary
 ```
+
+Translation runs as a persistent asynchronous job. Creating a job returns HTTP
+`202` immediately; clients poll every two seconds without keeping the DeepSeek
+request connection open:
+
+```text
+POST /auth/documents/{document_id}/translate
+GET  /auth/documents/translation-jobs/{job_id}
+```
+
+The status endpoint returns `pending`, `processing`, `completed`, or `failed`
+plus completed batches, total batches, percentage, and `request_id`. Completed
+responses include the existing translation result structure used by preview and
+export. `TRANSLATION_JOB_TIMEOUT_SECONDS` bounds background execution and
+terminal job status is retained for `TRANSLATION_JOB_TTL_SECONDS`. Apply
+`migrations/20260718_document_translation_jobs.sql` before deployment when the
+application database user cannot create tables automatically.
 
 Document translation sends at most `TRANSLATION_BATCH_SIZE` stable segments per
 DeepSeek request (default `20`). Truncated, invalid, or incomplete batch responses

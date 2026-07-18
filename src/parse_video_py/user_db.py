@@ -3,6 +3,7 @@
 Uses the same MySQL environment variables as ``web.py``. Local development
 falls back to the existing MATERIAL_DB_PATH SQLite database.
 """
+
 from __future__ import annotations
 
 import os
@@ -15,8 +16,19 @@ from pathlib import Path
 from urllib.parse import quote_plus
 
 from sqlalchemy import (
-    BigInteger, Column, ForeignKey, Index, LargeBinary, MetaData, String, Table,
-    Text, UniqueConstraint, create_engine, insert, select,
+    BigInteger,
+    Column,
+    ForeignKey,
+    Index,
+    LargeBinary,
+    MetaData,
+    String,
+    Table,
+    Text,
+    UniqueConstraint,
+    create_engine,
+    insert,
+    select,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.dialects.mysql import LONGTEXT, VARBINARY
@@ -25,7 +37,8 @@ _metadata = MetaData()
 _hash_binary_type = LargeBinary(32).with_variant(VARBINARY(32), "mysql")
 
 users = Table(
-    "users", _metadata,
+    "users",
+    _metadata,
     Column("id", String(36), primary_key=True),
     Column("internal_code", String(6), nullable=False, unique=True),
     Column("display_name", String(120), nullable=True),
@@ -35,25 +48,39 @@ users = Table(
 )
 
 user_identities = Table(
-    "user_identities", _metadata,
+    "user_identities",
+    _metadata,
     Column("id", String(36), primary_key=True),
-    Column("user_id", String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
+    Column(
+        "user_id",
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
     Column("provider", String(32), nullable=False),
     Column("provider_user_id", String(191), nullable=False),
     Column("unionid", String(191), nullable=True),
     Column("created_at", BigInteger, nullable=False),
     Column("updated_at", BigInteger, nullable=False),
-    UniqueConstraint("provider", "provider_user_id", name="uq_user_identity_provider_user"),
+    UniqueConstraint(
+        "provider", "provider_user_id", name="uq_user_identity_provider_user"
+    ),
     Index("ix_user_identities_unionid", "unionid"),
     Index("ix_user_identities_user_id", "user_id"),
 )
 
 qr_login_sessions = Table(
-    "qr_login_sessions", _metadata,
+    "qr_login_sessions",
+    _metadata,
     Column("id", String(36), primary_key=True),
     Column("scene_token_hash", _hash_binary_type, nullable=False, unique=True),
     Column("login_ticket_hash", _hash_binary_type, nullable=True, unique=True),
-    Column("user_id", String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True),
+    Column(
+        "user_id",
+        String(36),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    ),
     Column("status", String(20), nullable=False),
     Column("expires_at", BigInteger, nullable=False),
     Column("confirmed_at", BigInteger, nullable=True),
@@ -66,9 +93,15 @@ qr_login_sessions = Table(
 _long_text_type = Text().with_variant(LONGTEXT(), "mysql")
 
 documents = Table(
-    "documents", _metadata,
+    "documents",
+    _metadata,
     Column("id", String(36), primary_key=True),
-    Column("user_id", String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
+    Column(
+        "user_id",
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
     Column("filename", String(255), nullable=False),
     Column("file_type", String(10), nullable=False),
     Column("file_size", BigInteger, nullable=False),
@@ -89,25 +122,49 @@ documents = Table(
 )
 
 document_tasks = Table(
-    "document_tasks", _metadata,
+    "document_tasks",
+    _metadata,
     Column("id", String(36), primary_key=True),
-    Column("document_id", String(36), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False),
-    Column("user_id", String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
+    Column(
+        "document_id",
+        String(36),
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "user_id",
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
     Column("task_type", String(32), nullable=False),
     Column("status", String(20), nullable=False),
     Column("error_message", String(1000), nullable=True),
     Column("created_at", BigInteger, nullable=False),
     Column("updated_at", BigInteger, nullable=False),
     Column("completed_at", BigInteger, nullable=True),
-    UniqueConstraint("document_id", "task_type", name="uq_document_tasks_document_type"),
+    UniqueConstraint(
+        "document_id", "task_type", name="uq_document_tasks_document_type"
+    ),
     Index("ix_document_tasks_user_created", "user_id", "created_at"),
 )
 
 document_translations = Table(
-    "document_translations", _metadata,
+    "document_translations",
+    _metadata,
     Column("id", String(36), primary_key=True),
-    Column("document_id", String(36), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False),
-    Column("user_id", String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
+    Column(
+        "document_id",
+        String(36),
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "user_id",
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
     Column("options_hash", _hash_binary_type, nullable=False),
     Column("source_language", String(32), nullable=False),
     Column("detected_source_language", String(32), nullable=True),
@@ -122,16 +179,65 @@ document_translations = Table(
     Column("updated_at", BigInteger, nullable=False),
     Column("completed_at", BigInteger, nullable=True),
     UniqueConstraint(
-        "document_id", "user_id", "options_hash",
+        "document_id",
+        "user_id",
+        "options_hash",
         name="uq_document_translations_document_options",
     ),
     Index("ix_document_translations_user_created", "user_id", "created_at"),
 )
 
-file_processing_history = Table(
-    "file_processing_history", _metadata,
+document_translation_jobs = Table(
+    "document_translation_jobs",
+    _metadata,
     Column("id", String(36), primary_key=True),
-    Column("user_id", String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
+    Column(
+        "document_id",
+        String(36),
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "user_id",
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("options_hash", _hash_binary_type, nullable=False),
+    Column("options_json", _long_text_type, nullable=False),
+    Column("translation_id", String(36), nullable=True),
+    Column("request_id", String(36), nullable=False),
+    Column("status", String(20), nullable=False),
+    Column("completed_batches", BigInteger, nullable=False),
+    Column("total_batches", BigInteger, nullable=False),
+    Column("cached", BigInteger, nullable=False),
+    Column("error_code", String(64), nullable=True),
+    Column("error_message", String(1000), nullable=True),
+    Column("created_at", BigInteger, nullable=False),
+    Column("started_at", BigInteger, nullable=True),
+    Column("updated_at", BigInteger, nullable=False),
+    Column("completed_at", BigInteger, nullable=True),
+    Column("expires_at", BigInteger, nullable=False),
+    UniqueConstraint(
+        "document_id",
+        "user_id",
+        "options_hash",
+        name="uq_document_translation_jobs_options",
+    ),
+    Index("ix_document_translation_jobs_user_updated", "user_id", "updated_at"),
+    Index("ix_document_translation_jobs_status_expires", "status", "expires_at"),
+)
+
+file_processing_history = Table(
+    "file_processing_history",
+    _metadata,
+    Column("id", String(36), primary_key=True),
+    Column(
+        "user_id",
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
     Column("source_filename", String(255), nullable=False),
     Column("source_file_size", BigInteger, nullable=False),
     Column("category", String(20), nullable=False),
@@ -186,8 +292,10 @@ def _new_internal_code() -> str:
 
 def _row_to_user(row) -> SystemUser:
     return SystemUser(
-        id=row["id"], internal_code=row["internal_code"],
-        display_name=row["display_name"], avatar_url=row["avatar_url"],
+        id=row["id"],
+        internal_code=row["internal_code"],
+        display_name=row["display_name"],
+        avatar_url=row["avatar_url"],
     )
 
 
@@ -202,36 +310,56 @@ def get_or_create_user(openid: str, unionid: str | None = None) -> SystemUser:
     for _ in range(12):
         try:
             with _engine.begin() as conn:
-                existing = conn.execute(
-                    select(users).join(user_identities).where(
-                        user_identities.c.provider == "wechat_miniprogram",
-                        user_identities.c.provider_user_id == openid,
+                existing = (
+                    conn.execute(
+                        select(users)
+                        .join(user_identities)
+                        .where(
+                            user_identities.c.provider == "wechat_miniprogram",
+                            user_identities.c.provider_user_id == openid,
+                        )
                     )
-                ).mappings().first()
+                    .mappings()
+                    .first()
+                )
                 if existing:
                     return _row_to_user(existing)
 
                 linked_user_id = None
                 if unionid:
                     linked_user_id = conn.execute(
-                        select(user_identities.c.user_id).where(
-                            user_identities.c.unionid == unionid
-                        ).limit(1)
+                        select(user_identities.c.user_id)
+                        .where(user_identities.c.unionid == unionid)
+                        .limit(1)
                     ).scalar_one_or_none()
 
                 now = int(time.time())
                 user_id = linked_user_id or str(uuid.uuid4())
                 if not linked_user_id:
-                    conn.execute(insert(users).values(
-                        id=user_id, internal_code=_new_internal_code(),
-                        created_at=now, updated_at=now,
-                    ))
-                conn.execute(insert(user_identities).values(
-                    id=str(uuid.uuid4()), user_id=user_id,
-                    provider="wechat_miniprogram", provider_user_id=openid,
-                    unionid=unionid, created_at=now, updated_at=now,
-                ))
-                row = conn.execute(select(users).where(users.c.id == user_id)).mappings().one()
+                    conn.execute(
+                        insert(users).values(
+                            id=user_id,
+                            internal_code=_new_internal_code(),
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
+                conn.execute(
+                    insert(user_identities).values(
+                        id=str(uuid.uuid4()),
+                        user_id=user_id,
+                        provider="wechat_miniprogram",
+                        provider_user_id=openid,
+                        unionid=unionid,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                row = (
+                    conn.execute(select(users).where(users.c.id == user_id))
+                    .mappings()
+                    .one()
+                )
                 return _row_to_user(row)
         except IntegrityError:
             # Another request may have inserted the same OpenID or internal code.
@@ -248,10 +376,12 @@ def get_wechat_openid_for_user(user_id: str) -> str:
     init_user_database()
     with _engine.connect() as conn:
         openid = conn.execute(
-            select(user_identities.c.provider_user_id).where(
+            select(user_identities.c.provider_user_id)
+            .where(
                 user_identities.c.user_id == user_id,
                 user_identities.c.provider == "wechat_miniprogram",
-            ).limit(1)
+            )
+            .limit(1)
         ).scalar_one_or_none()
     if not openid:
         raise ValueError("user has no bound WeChat mini-program identity")

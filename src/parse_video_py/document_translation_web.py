@@ -11,8 +11,10 @@ from parse_video_py.document_summary_web import _current_user
 from parse_video_py.document_translation import (
     DocumentTranslationBusyError,
     DocumentTranslationError,
+    create_translation_job,
+    get_translation_job,
     render_translation_export,
-    translate_document,
+    schedule_translation_job,
 )
 
 router = APIRouter(prefix="/auth/documents", tags=["document-translation"])
@@ -46,13 +48,13 @@ def _service_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=500, detail="文档翻译失败")
 
 
-@router.post("/{document_id}/translate")
+@router.post("/{document_id}/translate", status_code=202)
 async def translate_uploaded_document(
     request: Request, document_id: str, payload: TranslationRequest
 ):
     user = _current_user(request)
     try:
-        return await translate_document(
+        job, should_schedule = create_translation_job(
             user.id,
             document_id,
             source_language=payload.source_language,
@@ -61,6 +63,18 @@ async def translate_uploaded_document(
             style=payload.style,
             glossary=[item.model_dump() for item in payload.glossary],
         )
+        if should_schedule:
+            schedule_translation_job(job["job_id"])
+        return job
+    except Exception as exc:
+        raise _service_error(exc) from exc
+
+
+@router.get("/translation-jobs/{job_id}")
+def translation_job_status(request: Request, job_id: str):
+    user = _current_user(request)
+    try:
+        return get_translation_job(user.id, job_id)
     except Exception as exc:
         raise _service_error(exc) from exc
 
