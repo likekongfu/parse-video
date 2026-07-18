@@ -91,10 +91,33 @@ if [[ "$MYSQL_HEALTH" != "healthy" ]]; then
   exit 1
 fi
 
+safe_cleanup() {
+  echo "===== Docker disk usage before cleanup ====="
+  docker system df || true
+
+  echo "===== Removing dangling images ====="
+  docker image prune -f || true
+
+  echo "===== Removing build cache older than 7 days ====="
+  docker builder prune -f --filter "until=168h" || true
+
+  echo "===== Removing unused Docker networks ====="
+  docker network prune -f || true
+
+  echo "===== Limiting system journal to 200 MiB ====="
+  journalctl --vacuum-size=200M >/dev/null 2>&1 || true
+
+  echo "===== Docker disk usage after cleanup ====="
+  docker system df || true
+  df -h /
+}
+
+safe_cleanup
+
 AVAILABLE_KB="$(df -Pk / | awk 'NR==2 {print $4}')"
-MIN_KB=$((3 * 1024 * 1024))
+MIN_KB=$((4 * 1024 * 1024))
 if (( AVAILABLE_KB < MIN_KB )); then
-  echo "Less than 3 GiB free on /. Build cancelled."
+  echo "Less than 4 GiB free on /. Build cancelled."
   df -h /
   exit 1
 fi
@@ -127,5 +150,14 @@ for service in "${SERVICES[@]}"; do
 
   wait_healthy "$service"
 done
+
+
+echo "===== Post-deploy cleanup ====="
+docker image prune -f || true
+docker builder prune -f --filter "until=168h" || true
+
+echo "===== Final disk usage ====="
+df -h /
+docker system df
 
 docker compose ps
