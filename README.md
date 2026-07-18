@@ -255,7 +255,32 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 DEEPSEEK_API_URL=https://api.deepseek.com/chat/completions
 DEEPSEEK_TIMEOUT_SECONDS=120
 DEEPSEEK_MAX_INPUT_CHARS=100000
+TRANSLATION_BATCH_SIZE=20
+PDF_TRANSLATION_MIN_SCALE=0.50
 DOCUMENT_SUMMARY_UPLOAD_DIR=/app/data/document-summary
+```
+
+Document translation sends at most `TRANSLATION_BATCH_SIZE` stable segments per
+DeepSeek request (default `20`). Truncated, invalid, or incomplete batch responses
+are retried at most twice and then bisected; export generation starts only after
+all batches complete successfully. DOCX translation export in `translation` mode
+uses the uploaded DOCX as a template and replaces matching paragraphs/table rows
+in place, so headings, paragraph styles, tables, headers, footers, and embedded
+media are preserved as much as the original document allows. `bilingual` mode
+still generates a readable comparison document because it must add extra source
+and translated paragraphs.
+
+For a text-based PDF translated in `translation` mode, export `format=pdf` to
+reuse the uploaded PDF pages and replace text inside the original page/block
+coordinates. Page size, page count, images, vector graphics, and other content
+outside translated text blocks remain in the original PDF. Text is scaled down
+only as far as `PDF_TRANSLATION_MIN_SCALE` (default `0.50`); if a translated block
+still cannot fit, export fails explicitly instead of truncating it. Scanned PDFs,
+encrypted PDFs, and original-layout bilingual PDF export are not supported by
+this path.
+
+```text
+GET /auth/documents/{document_id}/translations/{translation_id}/export?format=pdf
 ```
 
 Apply `migrations/20260713_document_summary.sql` to the same MySQL database used by the unified user tables. Never expose `DEEPSEEK_API_KEY` to the browser or mini-program.

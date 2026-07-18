@@ -70,7 +70,10 @@ def export_translation(
     request: Request,
     document_id: str,
     translation_id: str,
-    format: str = Query(pattern="^(docx|txt)$"),
+    format: str = Query(
+        pattern="^(pdf|docx|txt)$",
+        description="导出格式；PDF 原文件可用 pdf 保留原页面版式",
+    ),
 ):
     user = _current_user(request)
     try:

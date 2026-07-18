@@ -40,6 +40,9 @@ services:
         condition: service_healthy
     env_file:
       - ./env/parse-video.env
+    environment:
+      TRANSLATION_BATCH_SIZE: ${TRANSLATION_BATCH_SIZE:-20}
+      PDF_TRANSLATION_MIN_SCALE: ${PDF_TRANSLATION_MIN_SCALE:-0.50}
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
