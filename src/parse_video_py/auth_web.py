@@ -41,6 +41,7 @@ from parse_video_py.qr_auth import (
     get_qr_status,
     mark_qr_scanned,
     verify_web_session,
+    WEB_SESSION_TTL_SECONDS,
 )
 
 logger = logging.getLogger("auth_web")
@@ -444,7 +445,7 @@ async def exchange_qr(request: Request, response: Response):
     except ValueError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     response.set_cookie(
-        key="web_session", value=session_token, max_age=30 * 24 * 60 * 60,
+        key="web_session", value=session_token, max_age=WEB_SESSION_TTL_SECONDS,
         httponly=True,
         secure=os.getenv("WEB_COOKIE_SECURE", "false").lower() == "true",
         samesite="lax", path="/",

@@ -725,8 +725,6 @@ def test_original_layout_pdf_export_rejects_bilingual_mode(monkeypatch, tmp_path
 
     assert translated.status_code == 422
     assert translated.json()["detail"] == "PDF翻译暂不支持双语模式"
-
-
 def test_old_docx_result_without_location_requires_retranslation(monkeypatch, tmp_path):
     client, user, _ = _build_app(monkeypatch, tmp_path)
     with patch.object(summary_web, "verify_web_session", return_value=user):

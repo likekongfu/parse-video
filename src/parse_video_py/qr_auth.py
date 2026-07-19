@@ -20,6 +20,7 @@ from parse_video_py.user_db import (
 )
 
 QR_LOGIN_TTL = 180
+WEB_SESSION_TTL_SECONDS = 24 * 60 * 60
 
 
 def _key() -> bytes:
@@ -240,7 +241,7 @@ def exchange_login_ticket(login_ticket: str) -> SystemUser:
         )
 
 
-def create_web_session(user_id: str, ttl: int = 30 * 24 * 60 * 60) -> str:
+def create_web_session(user_id: str, ttl: int = WEB_SESSION_TTL_SECONDS) -> str:
     payload = {"uid": user_id, "exp": int(time.time()) + ttl}
     encoded = base64.urlsafe_b64encode(
         json.dumps(payload, separators=(",", ":")).encode()

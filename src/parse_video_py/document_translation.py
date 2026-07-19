@@ -119,7 +119,6 @@ class PDFLayoutOverflowError(DocumentTranslationError):
             "translated_length": self.translated_length,
         }
 
-
 class InvalidTranslationResponseError(DocumentTranslationError):
     """The model response cannot be decoded as a translation payload."""
 

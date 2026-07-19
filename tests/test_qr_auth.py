@@ -1,3 +1,5 @@
+import base64
+import json
 import os
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -51,6 +53,24 @@ def test_qr_login_service_full_flow_and_one_time_ticket(isolated_qr_db):
 
     web_session = qr_auth.create_web_session(user.id)
     assert qr_auth.verify_web_session(web_session).id == user.id
+
+
+def test_web_session_uses_a_24_hour_token_expiry(isolated_qr_db, monkeypatch):
+    now = 1_800_000_000
+    user = user_db.get_or_create_user("web-session-openid")
+    monkeypatch.setattr(qr_auth.time, "time", lambda: now)
+
+    token = qr_auth.create_web_session(user.id)
+    encoded, _signature = token.split(".", 1)
+    payload = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+    assert payload["exp"] == now + qr_auth.WEB_SESSION_TTL_SECONDS == now + 86_400
+    assert qr_auth.verify_web_session(token).id == user.id
+
+    monkeypatch.setattr(qr_auth.time, "time", lambda: now + 86_399)
+    assert qr_auth.verify_web_session(token).id == user.id
+    monkeypatch.setattr(qr_auth.time, "time", lambda: now + 86_400)
+    with pytest.raises(ValueError, match="网页会话无效"):
+        qr_auth.verify_web_session(token)
 
 
 def test_expired_code_can_be_replaced_with_a_fresh_code(isolated_qr_db, monkeypatch):
@@ -141,6 +161,7 @@ def test_qr_routes_keep_expected_contract():
         response = client.post("/auth/qr/exchange", json={"login_ticket": "ticket"})
         assert response.status_code == 200
         assert response.cookies.get("web_session") == "signed-session"
+        assert "Max-Age=86400" in response.headers["set-cookie"]
         assert response.json() == {
             "status": "ok",
             "openidToken": "signed-openid-token",
